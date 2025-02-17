@@ -2,57 +2,29 @@ import functools
 import time
 from typing import Callable, Optional, NamedTuple
 
+import hydra
 import flax
-import flax.linen as nn
 from flax.training.train_state import TrainState
 import jax
 from jax import numpy as jnp
 import optax
 from absl import logging
+from utils import gradient_update_fn
 
 from envs.wrappers import TrajectoryIdWrapper
 from src.evaluator import CrlEvaluator
 from src.replay_buffer import ReplayBufferState, Transition, TrajectoryUniformSamplingQueue
+from stoix.networks.base import ResNet
 
-Metrics = types.Metrics
-Env = envs.Env
-State = envs.State
+
+# Metrics = types.Metrics
+# Env = envs.Env
+# State = envs.State
 _PMAP_AXIS_NAME = "i"
 
 # The SAEncoder, GoalEncoder, and Actor all use the same function. Output size for SA/Goal encoders should be representation size, and for Actor should be 2 * action_size.
 # To keep parity with the existing architecture, by default we only use one residual block of depth 2, hence effectively not using the residual connections.
 
-
-class Net(nn.Module):
-    """
-    MLP with residual connections: residual blocks have $block_size layers. Uses swish activation, optionally uses layernorm.
-    """
-    output_size: int
-    width: int = 1024
-    num_blocks: int = 1
-    block_size: int = 2
-    use_ln: bool = True
-
-    @nn.compact
-    def __call__(self, x):
-        lecun_uniform = nn.initializers.variance_scaling(
-            1/3, "fan_in", "uniform")
-        normalize = nn.LayerNorm() if self.use_ln else (lambda x: x)
-
-        # Start of net
-        residual_stream = jnp.zeros((x.shape[0], self.width))
-
-        # Main body
-        for i in range(self.num_blocks):
-            for j in range(self.block_size):
-                x = nn.swish(
-                    normalize(nn.Dense(self.width, kernel_init=lecun_uniform)(x)))
-            x += residual_stream
-            residual_stream = x
-
-        # Last layer mapping to representation dimension
-        x = nn.Dense(self.output_size, kernel_init=lecun_uniform)(x)
-        return x
 
 # The brax version of this does not take in the actor and action_distribution arguments; before we pass it to brax evaluator or return it from train(), we do a partial application.
 
@@ -570,14 +542,20 @@ def train(
         num_envs=num_envs,
         episode_length=episode_length,
     )
+
+    def jit_wrap(buffer):
+        buffer.insert_internal = jax.jit(buffer.insert_internal)
+        buffer.sample_internal = jax.jit(buffer.sample_internal)
+        return buffer
+
     replay_buffer = jit_wrap(replay_buffer)
 
     # Network functions
     block_size = 2  # Maybe make this a hyperparameter
     num_blocks = max(1, n_hidden // block_size)
-    actor = Net(action_size * 2, h_dim, num_blocks, block_size, use_ln)
-    sa_encoder = Net(repr_dim, h_dim, num_blocks, block_size, use_ln)
-    g_encoder = Net(repr_dim, h_dim, num_blocks, block_size, use_ln)
+    actor = ResNet(action_size * 2, h_dim, num_blocks, block_size, use_ln)
+    sa_encoder = ResNet(repr_dim, h_dim, num_blocks, block_size, use_ln)
+    g_encoder = ResNet(repr_dim, h_dim, num_blocks, block_size, use_ln)
     # Would like to replace this but it's annoying to.
     parametric_action_distribution = distribution.NormalTanhDistribution(
         event_size=action_size)
@@ -590,11 +568,11 @@ def train(
     del global_key
 
     # Update functions (may replace later: brax makes it opaque)
-    alpha_update = gradients.gradient_update_fn(
+    alpha_update = gradient_update_fn(
         alpha_loss, training_state.alpha_state.tx, pmap_axis_name=_PMAP_AXIS_NAME)
-    actor_update = gradients.gradient_update_fn(
+    actor_update = gradient_update_fn(
         actor_loss, training_state.actor_state.tx, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
-    critic_update = gradients.gradient_update_fn(
+    critic_update = gradient_update_fn(
         critic_loss, training_state.critic_state.tx, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
 
     def update_step(carry, transitions):
@@ -811,7 +789,7 @@ def train(
                 params = _unpmap(
                     (training_state.actor_state.params, training_state.critic_state.params))
                 path = f"{checkpoint_logdir}/step_{current_step}.pkl"
-                brax.io.model.save_params(path, params)
+                # brax.io.model.save_params(path, params)
 
             # Run evals
             metrics = evaluator.run_evaluation(
@@ -834,3 +812,25 @@ def train(
     params = _unpmap((training_state.actor_state.params,
                      training_state.critic_state.params))
     return (make_policy, params, metrics)
+
+
+@hydra.main(
+    config_path="../../configs/default/anakin",
+    config_name="default_ff_reinforce.yaml",
+    version_base="1.2",
+)
+def hydra_entry_point(cfg: DictConfig) -> float:
+    """Experiment entry point."""
+    # Allow dynamic attributes.
+    OmegaConf.set_struct(cfg, False)
+
+    # Run experiment.
+    eval_performance = run_experiment(cfg)
+
+    print(f"{Fore.CYAN}{Style.BRIGHT}Contrastive RL experiment completed{
+          Style.RESET_ALL}")
+    return eval_performance
+
+
+if __name__ == "__main__":
+    hydra_entry_point()

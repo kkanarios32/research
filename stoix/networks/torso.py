@@ -2,11 +2,44 @@ from typing import Sequence
 
 import chex
 import numpy as np
+import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen.initializers import Initializer, orthogonal
 
 from stoix.networks.layers import NoisyLinear
 from stoix.networks.utils import parse_activation_fn
+
+
+class ContrastiveTorso(nn.Module):
+    """
+    MLP with residual connections: residual blocks have $block_size layers. Uses swish activation, optionally uses layernorm.
+    """
+    output_size: int
+    width: int = 1024
+    num_blocks: int = 1
+    block_size: int = 2
+    use_layer_norm: bool = True
+
+    @nn.compact
+    def __call__(self, x):
+        lecun_uniform = nn.initializers.variance_scaling(
+            1/3, "fan_in", "uniform")
+        normalize = nn.LayerNorm() if self.use_layer_norm else (lambda x: x)
+
+        # Start of net
+        residual_stream = jnp.zeros((x.shape[0], self.width))
+
+        # Main body
+        for i in range(self.num_blocks):
+            for j in range(self.block_size):
+                x = nn.swish(
+                    normalize(nn.Dense(self.width, kernel_init=lecun_uniform)(x)))
+            x += residual_stream
+            residual_stream = x
+
+        # Last layer mapping to representation dimension
+        x = nn.Dense(self.output_size, kernel_init=lecun_uniform)(x)
+        return x
 
 
 class MLPTorso(nn.Module):
@@ -81,7 +114,8 @@ class CNNTorso(nn.Module):
         # Convolutional layers
         for channel, kernel, stride in zip(self.channel_sizes, self.kernel_sizes, self.strides):
             x = nn.Conv(
-                channel, (kernel, kernel), (stride, stride), use_bias=not self.use_layer_norm
+                channel, (kernel, kernel), (stride,
+                                            stride), use_bias=not self.use_layer_norm
             )(x)
             if self.use_layer_norm:
                 x = nn.LayerNorm(reduction_axes=(-3, -2, -1))(x)

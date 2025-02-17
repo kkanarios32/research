@@ -33,6 +33,16 @@ class ObservationActionInput(nn.Module):
         return x
 
 
+class CNNObservationActionInput(nn.Module):
+    """Observation and Action Input."""
+
+    @nn.compact
+    def __call__(self, observation: Observation, action: chex.Array) -> chex.Array:
+        observation = observation.agent_view
+        x = jnp.concatenate([observation, action], axis=-1)
+        return x
+
+
 class EmbeddingActionInput(nn.Module):
 
     action_dim: int
@@ -51,4 +61,14 @@ class EmbeddingActionOnehotInput(nn.Module):
     def __call__(self, observation_embedding: chex.Array, action: chex.Array) -> chex.Array:
         action_one_hot = jax.nn.one_hot(action, self.action_dim)
         x = jnp.concatenate([observation_embedding, action_one_hot], axis=-1)
+        return x
+
+
+class ObservationGoalInput(nn.Module):
+    """Only Observation Input."""
+
+    @nn.compact
+    def __call__(self, observation: Observation, goal: chex.Array) -> chex.Array:
+        observation = observation.agent_view
+        x = jnp.concatenate([observation, goal], axis=-1)
         return x

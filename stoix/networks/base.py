@@ -10,8 +10,19 @@ import numpy as np
 from flax import linen as nn
 
 from stoix.base_types import Observation, RNNObservation
-from stoix.networks.inputs import ObservationInput
+from stoix.networks.inputs import ObservationInput, ObservationGoalInput
 from stoix.networks.utils import parse_rnn_cell
+
+
+class ContrastiveNet(nn.Module):
+    torso: nn.Module
+    input_layer: nn.Module
+
+    @nn.compact
+    def __call__(self, *inputs):
+        embedding = self.input_layer(*inputs)
+        x = self.torso(embedding)
+        return x
 
 
 class FeedForwardActor(nn.Module):
@@ -99,7 +110,8 @@ class ScannedRNN(nn.Module):
     def __call__(self, rnn_state: chex.Array, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
         """Applies the module."""
         ins, resets = x
-        hidden_state_reset_fn = lambda reset_state, current_state: jnp.where(
+
+        def hidden_state_reset_fn(reset_state, current_state): return jnp.where(
             resets[:, np.newaxis],
             reset_state,
             current_state,
@@ -194,5 +206,6 @@ def chained_torsos(torso_cfgs: List[Dict[str, Any]]) -> nn.Module:
         torso_cfgs: List of dictionaries containing the configuration for each torso.
             These configs should use the same format as the individual torso configs."""
 
-    torso_modules = [hydra.utils.instantiate(torso_cfg) for torso_cfg in torso_cfgs]
+    torso_modules = [hydra.utils.instantiate(
+        torso_cfg) for torso_cfg in torso_cfgs]
     return CompositeNetwork(torso_modules)

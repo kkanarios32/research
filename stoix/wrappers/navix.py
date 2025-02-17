@@ -7,8 +7,9 @@ from jumanji import specs
 from jumanji.specs import Array, DiscreteArray, Spec
 from jumanji.types import StepType, TimeStep, restart
 from jumanji.wrappers import Wrapper
-from navix.environments import Environment
-from navix.environments import Timestep as NavixState
+from navix.environments.environment import Environment
+from navix.environments.environment import Timestep as NavixState
+from navix.entities import Entities
 
 from stoix.base_types import Observation
 
@@ -95,3 +96,46 @@ class NavixWrapper(Wrapper):
             action_mask=action_mask_spec,
             step_count=Array(shape=(), dtype=int),
         )
+
+
+# Hack to just replace goal entity with new randomly sampled one on reset.
+class NavixGoalWrapper(Wrapper):
+    def __init__(self, env: Environment):
+        self._env = env
+        self._n_actions = len(self._env.action_set)
+
+    def reset(self, key: chex.PRNGKey) -> Tuple[NavixEnvState, TimeStep]:
+        state, timestep = self._env.reset(key)
+        goal = state.navix_state.state.entities[Entities.GOAL].position
+        timestep.extras["goal"] = goal
+        return state, timestep
+
+    def step(self, state: NavixEnvState, action: chex.Array) -> Tuple[NavixEnvState, TimeStep]:
+        next_state, timestep = self._env.step(state.navix_state, action)
+        goal = next_state.navix_state.state.entities[Entities.GOAL].position
+
+        timestep.extras["goal"] = goal
+        return next_state, timestep
+
+    def reward_spec(self) -> specs.Array:
+        return self._env.reward_spec()
+
+    def discount_spec(self) -> specs.BoundedArray:
+        return self._env.discount_spec()
+
+    def action_spec(self) -> Spec:
+        return self._env.action_spec()
+
+    def observation_spec(self) -> Spec:
+        return self._env.observation_spec()
+
+    def goal_spec(self) -> Spec:
+        goal_min = [0, 0]
+        goal_max = [self._env.height, self._env.width]
+        goal_spec = specs.BoundedArray(
+            shape=(2,),
+            dtype=float,
+            minimum=goal_min,
+            maximum=goal_max,
+        )
+        return goal_spec

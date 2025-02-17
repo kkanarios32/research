@@ -175,7 +175,8 @@ def make_jaxmarl_env(
 
     kwargs = dict(config.env.kwargs)
     if "smax" in env_name.lower():
-        kwargs["scenario"] = map_name_to_scenario(config.env.scenario.task_name)
+        kwargs["scenario"] = map_name_to_scenario(
+            config.env.scenario.task_name)
 
     # Create jaxmarl envs.
     env = _jaxmarl_wrappers.get(config.env.env_name, JaxMarlWrapper)(
@@ -198,7 +199,8 @@ def make_jaxmarl_env(
         env = MultiBoundedToBounded(env)
         eval_env = MultiBoundedToBounded(eval_env)
     else:
-        raise ValueError(f"Unsupported action spec for JAXMarl {env.action_spec()}.")
+        raise ValueError(f"""Unsupported action spec for JAXMarl {
+                         env.action_spec()}.""")
 
     env = AutoResetWrapper(env, next_obs_in_extras=True)
     env = RecordEpisodeMetrics(env)
@@ -375,14 +377,16 @@ def make_navix_env(env_name: str, config: DictConfig) -> Tuple[Environment, Envi
 
 def make_gymnasium_factory(env_name: str, config: DictConfig) -> GymnasiumFactory:
 
-    env_factory = GymnasiumFactory(env_name, init_seed=config.arch.seed, **config.env.kwargs)
+    env_factory = GymnasiumFactory(
+        env_name, init_seed=config.arch.seed, **config.env.kwargs)
 
     return env_factory
 
 
 def make_envpool_factory(env_name: str, config: DictConfig) -> EnvPoolFactory:
 
-    env_factory = EnvPoolFactory(env_name, init_seed=config.arch.seed, **config.env.kwargs)
+    env_factory = EnvPoolFactory(
+        env_name, init_seed=config.arch.seed, **config.env.kwargs)
 
     return env_factory
 

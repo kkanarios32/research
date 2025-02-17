@@ -1,12 +1,17 @@
+import navix as nx
+from navix.entities import Entities
+from stoix.wrappers.navix import NavixWrapper, NavixGoalWrapper
+from stoix.systems.gcrl.envs.random_goals import RandomGoals
+import jax
+import jax.numpy as jnp
+from jumanji.env import Environment
+import chex
 import copy
 import time
 from typing import Any, Dict, Tuple
 
-import chex
 import flax
 import hydra
-import jax
-import jax.numpy as jnp
 import optax
 import rlax
 from colorama import Fore, Style
@@ -25,9 +30,10 @@ from stoix.base_types import (
     OnPolicyLearnerState,
 )
 from stoix.evaluator import evaluator_setup, get_distribution_act_fn
-from stoix.networks.base import FeedForwardActor as Actor
-from stoix.networks.base import FeedForwardCritic as Critic
-from stoix.systems.vpg.vpg_types import Transition
+from stoix.networks.base import ContrastiveNet as Net
+from stoix.networks.torso import ContrastiveTorso as Torso
+from stoix.networks.inputs import ObservationActionInput, EmbeddingInput
+from stoix.systems.gcrl.gcrl_types import Transition
 from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
@@ -36,6 +42,7 @@ from stoix.utils.multistep import batch_discounted_returns
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 from stoix.wrappers.episode_metrics import get_final_step_metrics
+from stoix.wrappers.transforms import FlattenObservationWrapper
 
 
 def get_learner_fn(
@@ -73,11 +80,13 @@ def get_learner_fn(
 
             # LOG EPISODE METRICS
             done = timestep.last().reshape(-1)
+            goal = timestep.extras["goal"]
             info = timestep.extras["episode_metrics"]
 
             transition = Transition(
-                done, action, value, timestep.reward, last_timestep.observation, info
+                done, action, value, timestep.reward, timestep.observation, goal, info
             )
+
             learner_state = OnPolicyLearnerState(
                 params, opt_states, key, env_state, timestep)
             return learner_state, transition
@@ -232,69 +241,57 @@ def get_learner_fn(
 
 def learner_setup(
     env: Environment, keys: chex.Array, config: DictConfig
-) -> Tuple[LearnerFn[OnPolicyLearnerState], Actor, OnPolicyLearnerState]:
+):
     """Initialise learner_fn, network, optimiser, environment and states."""
     # Get available TPU cores.
     n_devices = len(jax.devices())
 
     # Get number/dimension of actions.
     num_actions = int(env.action_spec().num_values)
-    config.system.action_dim = num_actions
+    init_action = jnp.zeros((1, num_actions))
 
     # PRNG keys.
-    key, actor_net_key, critic_net_key = keys
+    key, sa_key, g_key = keys
 
-    # Define network and optimiser.
-    actor_torso = hydra.utils.instantiate(
-        config.network.actor_network.pre_torso)
-    actor_action_head = hydra.utils.instantiate(
-        config.network.actor_network.action_head, action_dim=num_actions
-    )
-    critic_torso = hydra.utils.instantiate(
-        config.network.critic_network.pre_torso)
-    critic_head = hydra.utils.instantiate(
-        config.network.critic_network.critic_head)
+    sa_network = Net(torso=Torso(
+        16), input_layer=ObservationActionInput())
+    g_network = Net(torso=Torso(16), input_layer=EmbeddingInput())
 
-    actor_network = Actor(torso=actor_torso, action_head=actor_action_head)
-    critic_network = Critic(torso=critic_torso, critic_head=critic_head)
+    sa_lr = make_learning_rate(config.system.actor_lr, config, 1, 1)
+    g_lr = make_learning_rate(config.system.critic_lr, config, 1, 1)
 
-    actor_lr = make_learning_rate(config.system.actor_lr, config, 1, 1)
-    critic_lr = make_learning_rate(config.system.critic_lr, config, 1, 1)
-
-    actor_optim = optax.chain(
+    sa_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(actor_lr, eps=1e-5),
+        optax.adam(sa_lr, eps=1e-5),
     )
-    critic_optim = optax.chain(
+    g_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(critic_lr, eps=1e-5),
+        optax.adam(g_lr, eps=1e-5),
     )
 
     # Initialise observation
-    init_x = env.observation_spec().generate_value()
-    init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
+    init_obs = env.observation_spec().generate_value()
+    init_obs = jax.tree_util.tree_map(lambda x: x[None, ...], init_obs)
+
+    init_goal = env.goal_spec().generate_value()
+    init_goal = jax.tree_util.tree_map(lambda x: x[None, ...], init_goal)
 
     # Initialise actor params and optimiser state.
-    actor_params = actor_network.init(actor_net_key, init_x)
-    actor_opt_state = actor_optim.init(actor_params)
+    sa_params = sa_network.init(sa_key, *(init_obs, init_action))
+    sa_opt_state = sa_optim.init(sa_params)
 
     # Initialise critic params and optimiser state.
-    critic_params = critic_network.init(critic_net_key, init_x)
-    critic_opt_state = critic_optim.init(critic_params)
+    g_params = g_network.init(g_key, init_goal)
+    g_opt_state = g_optim.init(g_params)
 
     # Pack params.
-    params = ActorCriticParams(actor_params, critic_params)
+    params = (sa_params, g_params)
 
-    actor_network_apply_fn = actor_network.apply
-    critic_network_apply_fn = critic_network.apply
+    sa_network_apply_fn = sa_network.apply
+    g_network_apply_fn = g_network.apply
 
     # Pack apply and update functions.
-    apply_fns = (actor_network_apply_fn, critic_network_apply_fn)
-    update_fns = (actor_optim.update, critic_optim.update)
-
-    # Get batched iterated update and replicate it to pmap it over cores.
-    learn = get_learner_fn(env, apply_fns, update_fns, config)
-    learn = jax.pmap(learn, axis_name="device")
+    apply_fns = (sa_network_apply_fn, g_network_apply_fn)
 
     # Initialise environment states and timesteps: across devices and batches.
     key, *env_keys = jax.random.split(
@@ -308,7 +305,7 @@ def learner_setup(
         (n_devices, config.arch.update_batch_size,
          config.arch.num_envs) + x.shape[1:]
     )
-    # (devices, update batch size, num_envs, ...)
+    # # (devices, update batch size, num_envs, ...)
     env_states = jax.tree_util.tree_map(reshape_states, env_states)
     timesteps = jax.tree_util.tree_map(reshape_states, timesteps)
 
@@ -331,7 +328,8 @@ def learner_setup(
     def reshape_keys(x): return x.reshape(
         (n_devices, config.arch.update_batch_size) + x.shape[1:])
     step_keys = reshape_keys(jnp.stack(step_keys))
-    opt_states = ActorCriticOptStates(actor_opt_state, critic_opt_state)
+
+    opt_states = (sa_opt_state, g_opt_state)
     replicate_learner = (params, opt_states)
 
     # Duplicate learner for update_batch_size.
@@ -348,182 +346,31 @@ def learner_setup(
     init_learner_state = OnPolicyLearnerState(
         params, opt_states, step_keys, env_states, timesteps)
 
-    return learn, actor_network, init_learner_state
+    return apply_fns, params
 
 
-def run_experiment(_config: DictConfig) -> float:
+def test() -> float:
     """Runs experiment."""
-    config = copy.deepcopy(_config)
-
-    # Calculate total timesteps.
-    n_devices = len(jax.devices())
-    config.num_devices = n_devices
-    config = check_total_timesteps(config)
-    assert (
-        config.arch.num_updates >= config.arch.num_evaluation
-    ), "Number of updates per evaluation must be less than total number of updates."
 
     # Create the environments for train and eval.
-    env, eval_env = environments.make(config=config)
+    env = nx.make("Navix-Random-Goals-6x6-v0")
+    env = NavixWrapper(env)
+    env = FlattenObservationWrapper(env)
+    env = NavixGoalWrapper(env)
+    key = jax.random.PRNGKey(0)
+    keys = jax.random.split(key, 3)
+    apply_fns, params = learner_setup(env, keys)
+    state, timestep = env.reset(key)
+    for i in range(10):
+        _key, key = jax.random.split(key)
+        state, timestep = env.reset(_key)
+        print(jnp.squeeze(
+            state.navix_state.state.entities[Entities.GOAL].position))
+        print(jnp.squeeze(timestep.extras["goal"]))
+        print(env.goal_spec().generate_value())
 
-    # PRNG keys.
-    key, key_e, actor_net_key, critic_net_key = jax.random.split(
-        jax.random.PRNGKey(config.arch.seed), num=4
-    )
-
-    # Setup learner.
-    learn, actor_network, learner_state = learner_setup(
-        env, (key, actor_net_key, critic_net_key), config
-    )
-
-    # Setup evaluator.
-    evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = evaluator_setup(
-        eval_env=eval_env,
-        key_e=key_e,
-        eval_act_fn=get_distribution_act_fn(config, actor_network.apply),
-        params=learner_state.params.actor_params,
-        config=config,
-    )
-
-    # Calculate number of updates per evaluation.
-    config.arch.num_updates_per_eval = config.arch.num_updates // config.arch.num_evaluation
-    steps_per_rollout = (
-        n_devices
-        * config.arch.num_updates_per_eval
-        * config.system.rollout_length
-        * config.arch.update_batch_size
-        * config.arch.num_envs
-    )
-
-    # Logger setup
-    logger = StoixLogger(config)
-    cfg: Dict = OmegaConf.to_container(config, resolve=True)
-    cfg["arch"]["devices"] = jax.devices()
-    pprint(cfg)
-
-    # Set up checkpointer
-    save_checkpoint = config.logger.checkpointing.save_model
-    if save_checkpoint:
-        checkpointer = Checkpointer(
-            metadata=config,  # Save all config as metadata in the checkpoint
-            model_name=config.system.system_name,
-            **config.logger.checkpointing.save_args,  # Checkpoint args
-        )
-
-    # Run experiment for a total number of evaluations.
-    max_episode_return = jnp.float32(-1e7)
-    best_params = unreplicate_batch_dim(learner_state.params.actor_params)
-    for eval_step in range(config.arch.num_evaluation):
-        # Train.
-        start_time = time.time()
-
-        learner_output = learn(learner_state)
-        jax.block_until_ready(learner_output)
-
-        # Log the results of the training.
-        elapsed_time = time.time() - start_time
-        t = int(steps_per_rollout * (eval_step + 1))
-        episode_metrics, ep_completed = get_final_step_metrics(
-            learner_output.episode_metrics)
-        episode_metrics["steps_per_second"] = steps_per_rollout / elapsed_time
-
-        # Separately log timesteps, actoring metrics and training metrics.
-        logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
-        if ep_completed:  # only log episode metrics if an episode was completed in the rollout.
-            logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
-        train_metrics = learner_output.train_metrics
-        # Calculate the number of optimiser steps per second. Since gradients are aggregated
-        # across the device and batch axis, we don't consider updates per device/batch as part of
-        # the SPS for the learner.
-        opt_steps_per_eval = config.arch.num_updates_per_eval
-        train_metrics["steps_per_second"] = opt_steps_per_eval / elapsed_time
-        logger.log(train_metrics, t, eval_step, LogEvent.TRAIN)
-
-        # Prepare for evaluation.
-        start_time = time.time()
-        trained_params = unreplicate_batch_dim(
-            learner_output.learner_state.params.actor_params
-        )  # Select only actor params
-        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
-        eval_keys = jnp.stack(eval_keys)
-        eval_keys = eval_keys.reshape(n_devices, -1)
-
-        # Evaluate.
-        evaluator_output = evaluator(trained_params, eval_keys)
-        jax.block_until_ready(evaluator_output)
-
-        # Log the results of the evaluation.
-        elapsed_time = time.time() - start_time
-        episode_return = jnp.mean(
-            evaluator_output.episode_metrics["episode_return"])
-
-        steps_per_eval = int(
-            jnp.sum(evaluator_output.episode_metrics["episode_length"]))
-        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
-        logger.log(evaluator_output.episode_metrics,
-                   t, eval_step, LogEvent.EVAL)
-
-        if save_checkpoint:
-            # Save checkpoint of learner state
-            checkpointer.save(
-                timestep=int(steps_per_rollout * (eval_step + 1)),
-                unreplicated_learner_state=unreplicate_n_dims(
-                    learner_output.learner_state),
-                episode_return=episode_return,
-            )
-
-        if config.arch.absolute_metric and max_episode_return <= episode_return:
-            best_params = copy.deepcopy(trained_params)
-            max_episode_return = episode_return
-
-        # Update runner state to continue training.
-        learner_state = learner_output.learner_state
-
-    # Measure absolute metric.
-    if config.arch.absolute_metric:
-        start_time = time.time()
-
-        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
-        eval_keys = jnp.stack(eval_keys)
-        eval_keys = eval_keys.reshape(n_devices, -1)
-
-        evaluator_output = absolute_metric_evaluator(best_params, eval_keys)
-        jax.block_until_ready(evaluator_output)
-
-        elapsed_time = time.time() - start_time
-        t = int(steps_per_rollout * (eval_step + 1))
-        steps_per_eval = int(
-            jnp.sum(evaluator_output.episode_metrics["episode_length"]))
-        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
-        logger.log(evaluator_output.episode_metrics,
-                   t, eval_step, LogEvent.ABSOLUTE)
-
-    # Stop the logger.
-    logger.stop()
-    # Record the performance for the final evaluation run. If the absolute metric is not
-    # calculated, this will be the final evaluation run.
-    eval_performance = float(
-        jnp.mean(evaluator_output.episode_metrics[config.env.eval_metric]))
-    return eval_performance
-
-
-@hydra.main(
-    config_path="../../configs/default/anakin",
-    config_name="default_ff_reinforce.yaml",
-    version_base="1.2",
-)
-def hydra_entry_point(cfg: DictConfig) -> float:
-    """Experiment entry point."""
-    # Allow dynamic attributes.
-    OmegaConf.set_struct(cfg, False)
-
-    # Run experiment.
-    eval_performance = run_experiment(cfg)
-
-    print(f"""{Fore.CYAN}{Style.BRIGHT}REINFORCE with Baseline experiment completed{
-          Style.RESET_ALL}""")
-    return eval_performance
+    return 0
 
 
 if __name__ == "__main__":
-    hydra_entry_point()
+    test()

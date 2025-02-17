@@ -520,8 +520,8 @@ def hydra_entry_point(cfg: DictConfig) -> float:
     # Run experiment.
     eval_performance = run_experiment(cfg)
 
-    print(f"""{Fore.CYAN}{Style.BRIGHT}REINFORCE with Baseline experiment completed{
-          Style.RESET_ALL}""")
+    print(f"{Fore.CYAN}{Style.BRIGHT}REINFORCE with Baseline experiment completed{
+          Style.RESET_ALL}")
     return eval_performance
 
 

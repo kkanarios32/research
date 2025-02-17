@@ -8,4 +8,4 @@ defaults:
 
 hydra:
   searchpath:
-    - file://stoix/configs
+    - configs
