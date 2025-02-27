@@ -1,4 +1,5 @@
 import navix as nx
+import distrax
 from navix.entities import Entities
 from stoix.wrappers.navix import NavixWrapper, NavixGoalWrapper
 from stoix.systems.gcrl.envs.random_goals import RandomGoals
@@ -115,7 +116,7 @@ def get_learner_fn(
 
             print("goal ", last_timestep.extras["goal"])
             action = actor_apply_fn(
-                params, last_timestep.observation, last_timestep.extras["goal"])
+                params, last_timestep.observation, last_timestep.extras["goal"], policy_key)
             # STEP ENVIRONMENT
             env_state, timestep = jax.vmap(
                 env.step, in_axes=(0, 0))(env_state, action)
@@ -127,7 +128,6 @@ def get_learner_fn(
             traj_id = timestep.extras["traj_id"]
             info = timestep.extras["episode_metrics"]
 
-            # Need to add back dimension b/c we needed to index by scalar
             transition = Transition(
                 done, action,
                 timestep.reward, timestep.observation,
@@ -198,8 +198,8 @@ def get_learner_fn(
         key, sample_key, flatten_key = jax.random.split(key, 3)
         traj_batch = buffer_sample_fn(buffer_state, sample_key)
 
-        # TODO: change to total_batch_size
-        flatten_keys = jax.random.split(flatten_key, 256)
+        flatten_keys = jax.random.split(
+            flatten_key, config.system.total_batch_size)
         traj_batch = vmap_flatten_crl_fn(
             config, env, traj_batch.experience, flatten_keys)
 
@@ -249,7 +249,7 @@ def get_learner_fn(
             _update_step, in_axes=(0, None), axis_name="batch")
 
         learner_state, (episode_info, loss_info) = jax.lax.scan(
-            batched_update_step, learner_state, None, 1
+            batched_update_step, learner_state, None, config.arch.num_updates_per_eval
         )
         return AnakinExperimentOutput(
             learner_state=learner_state,
@@ -341,7 +341,7 @@ def learner_setup(
     # print(f"broadcast actions: {actions.shape}")
 
     @jax.jit
-    def policy_apply_fn(params, observation, goal):
+    def policy_apply_fn(params, observation, goal, seed):
         sa_params, g_params = params
         vmap_sa = jax.vmap(sa_network_apply_fn, in_axes=(
             None, None, 0))
@@ -351,7 +351,7 @@ def learner_setup(
         print(f"goal output repr {g_repr}")
         logits = jnp.einsum("ijk,jk->ji", sa_repr, g_repr)
         print(f"logits: {logits}")
-        return jnp.argmax(logits, axis=1)
+        return distrax.EpsilonGreedy(preferences=logits, epsilon=.9).sample(seed=seed)
 
     # Pack apply and update functions.
     apply_fns = (sa_network_apply_fn, g_network_apply_fn, policy_apply_fn)
@@ -414,7 +414,7 @@ def learner_setup(
     init_learner_state = OffPolicyLearnerState(
         params, opt_states, buffer_states, step_keys, env_states, timesteps)
 
-    return learn, init_learner_state
+    return learn, init_learner_state, policy_apply_fn
 
 
 def train(_config):
@@ -427,16 +427,38 @@ def train(_config):
         config.arch.num_updates >= config.arch.num_evaluation
     ), "Number of updates per evaluation must be less than total number of updates."
 
-    env = nx.make("Navix-Empty-5x5-v0")
-    env = NavixWrapper(env)
-    env = FlattenObservationWrapper(env)
-    env = NavixGoalWrapper(env)
-    env = RecordEpisodeMetrics(env)
-    env = TrajectoryIdWrapper(env)
+    def make_gcrl_env(name):
+        env = nx.make(name)
+        env = NavixWrapper(env)
+        env = FlattenObservationWrapper(env)
+        env = NavixGoalWrapper(env)
+        env = RecordEpisodeMetrics(env)
+        env = TrajectoryIdWrapper(env)
+        return env
+
+    env = make_gcrl_env("Navix-Empty-5x5-v0")
+    eval_env = make_gcrl_env("Navix-Empty-5x5-v0")
 
     key = jax.random.PRNGKey(0)
-    keys = jax.random.split(key, 3)
-    learn, learner_state = learner_setup(env, keys, config)
+    key_e, *keys = jax.random.split(key, 4)
+    learn, learner_state, policy_fn = learner_setup(env, keys, config)
+
+    # Setup evaluator.
+    # evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = evaluator_setup(
+    #     eval_env=eval_env,
+    #     key_e=key_e,
+    #     eval_act_fn=get_distribution_act_fn(config, policy_fn),
+    #     params=learner_state.params.actor_params,
+    #     config=config,
+    # )
+    config.arch.num_updates_per_eval = config.arch.num_updates // config.arch.num_evaluation
+    steps_per_rollout = (
+        n_devices
+        * config.arch.num_updates_per_eval
+        * config.system.rollout_length
+        * config.arch.update_batch_size
+        * config.arch.num_envs
+    )
 
     # Logger setup
     logger = StoixLogger(config)
@@ -444,6 +466,7 @@ def train(_config):
     cfg["arch"]["devices"] = jax.devices()
     pprint(cfg)
 
+    # for eval_step in range(1):
     for eval_step in range(config.arch.num_evaluation):
         # Train.
         start_time = time.time()
@@ -455,11 +478,37 @@ def train(_config):
         elapsed_time = time.time() - start_time
         t = int(32 * (eval_step + 1))
 
-        logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
-
         episode_metrics, ep_completed = get_final_step_metrics(
             learner_output.episode_metrics)
         episode_metrics["steps_per_second"] = 32 / elapsed_time
+
+        # Separately log timesteps, actoring metrics and training metrics.
+        logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
+        if ep_completed:  # only log episode metrics if an episode was completed in the rollout.
+            logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
+        train_metrics = learner_output.train_metrics
+        # Calculate the number of optimiser steps per second. Since gradients are aggregated
+        # across the device and batch axis, we don't consider updates per device/batch as part of
+        # the SPS for the learner.
+        opt_steps_per_eval = config.arch.num_updates_per_eval
+        train_metrics["steps_per_second"] = opt_steps_per_eval / elapsed_time
+        logger.log(train_metrics, t, eval_step, LogEvent.TRAIN)
+
+        # Prepare for evaluation.
+        start_time = time.time()
+        trained_sa_params = unreplicate_batch_dim(
+            learner_output.learner_state.params.sa_params
+        )  # Select only actor params
+        trained_g_params = unreplicate_batch_dim(
+            learner_output.learner_state.params.g_params
+        )  # Select only actor params
+        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
+        eval_keys = jnp.stack(eval_keys)
+        eval_keys = eval_keys.reshape(n_devices, -1)
+
+        # Evaluate.
+        # evaluator_output = evaluator(trained_params, eval_keys)
+        # jax.block_until_ready(evaluator_output)
 
         # Separately log timesteps, actoring metrics and training metrics.
         learner_state = learner_output.learner_state
