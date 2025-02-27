@@ -29,7 +29,7 @@ class ObservationActionInput(nn.Module):
     @nn.compact
     def __call__(self, observation: Observation, action: chex.Array) -> chex.Array:
         observation = observation.agent_view
-        x = jnp.concatenate([observation, action], axis=-1)
+        x = jnp.concatenate([observation, action[..., None]], axis=-1)
         return x
 
 

@@ -134,10 +134,10 @@ class TrajectoryUniformSamplingQueue(QueueBase[Sample], Generic[Sample]):
     def sample_internal(self, buffer_state: ReplayBufferState) -> Tuple[ReplayBufferState, Sample]:
         if buffer_state.data.shape != self._data_shape:
             raise ValueError(
-                f"Data shape expected by the replay buffer ({
-                    self._data_shape}) does "
-                f"not match the shape of the buffer state ({
-                    buffer_state.data.shape})"
+                f"""Data shape expected by the replay buffer ({
+                    self._data_shape}) does """
+                f"""not match the shape of the buffer state ({
+                    buffer_state.data.shape})"""
             )
         key, sample_key, shuffle_key = jax.random.split(buffer_state.key, 3)
         # NOTE: this is the number of envs to sample but it can be modified if there is OOM

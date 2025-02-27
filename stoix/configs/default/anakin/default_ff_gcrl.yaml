@@ -1,9 +1,9 @@
 defaults:
   - logger: base_logger
   - arch: anakin
-  - system: q_learning/ff_dqn
-  - network: mlp_dqn
-  - env: gymnax/cartpole
+  - system: gcrl/ff_gcrl
+  - network: mlp
+  - env: navix/empty_5x5
   - _self_
 
 hydra:

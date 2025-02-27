@@ -10,6 +10,8 @@ from jumanji.wrappers import Wrapper
 from navix.environments.environment import Environment
 from navix.environments.environment import Timestep as NavixState
 from navix.entities import Entities
+from navix.grid import random_positions, room
+from navix.entities import Entities, Goal, Player
 
 from stoix.base_types import Observation
 
@@ -98,23 +100,35 @@ class NavixWrapper(Wrapper):
         )
 
 
-# Hack to just replace goal entity with new randomly sampled one on reset.
+# add goal to extras
 class NavixGoalWrapper(Wrapper):
     def __init__(self, env: Environment):
         self._env = env
         self._n_actions = len(self._env.action_set)
 
     def reset(self, key: chex.PRNGKey) -> Tuple[NavixEnvState, TimeStep]:
-        state, timestep = self._env.reset(key)
-        goal = state.navix_state.state.entities[Entities.GOAL].position
-        timestep.extras["goal"] = goal
+        key_1, key_2, key_3 = jax.random.split(key, 3)
+        state, timestep = self._env.reset(key_1)
+
+        player_pos = state.navix_state.state.get_player().position
+        grid = room(height=self.height, width=self.width)
+        goal_pos = random_positions(
+            key_2, grid, n=1, exclude=jnp.array([player_pos]))
+        # goal
+        goal = Goal.create(position=goal_pos, probability=jnp.asarray(1.0))
+        state.navix_state.state.set_goals(goal[None])
+
+        timestep.extras["goal"] = goal_pos
+        timestep.extras["player"] = player_pos
         return state, timestep
 
     def step(self, state: NavixEnvState, action: chex.Array) -> Tuple[NavixEnvState, TimeStep]:
-        next_state, timestep = self._env.step(state.navix_state, action)
-        goal = next_state.navix_state.state.entities[Entities.GOAL].position
+        next_state, timestep = self._env.step(state, action)
 
-        timestep.extras["goal"] = goal
+        timestep.extras["goal"] = next_state.navix_state.state.get_goals(
+        ).position[0]
+        timestep.extras["player"] = next_state.navix_state.state.get_player(
+        ).position
         return next_state, timestep
 
     def reward_spec(self) -> specs.Array:

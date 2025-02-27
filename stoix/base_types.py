@@ -185,7 +185,8 @@ class EvaluationOutput(NamedTuple, Generic[StoixState]):
 
 RNNObservation: TypeAlias = Tuple[Observation, Done]
 LearnerFn = Callable[[StoixState], AnakinExperimentOutput[StoixState]]
-SebulbaLearnerFn = Callable[[StoixState, StoixTransition], SebulbaExperimentOutput[StoixState]]
+SebulbaLearnerFn = Callable[[
+    StoixState, StoixTransition], SebulbaExperimentOutput[StoixState]]
 EvalFn = Callable[[FrozenDict, chex.PRNGKey], EvaluationOutput[StoixState]]
 SebulbaEvalFn = Callable[[FrozenDict, chex.PRNGKey], Dict[str, chex.Array]]
 
@@ -200,6 +201,8 @@ RecActorApply = Callable[
     [FrozenDict, HiddenState, RNNObservation], Tuple[HiddenState, DistributionLike]
 ]
 RecActFn = Callable[
-    [FrozenDict, HiddenState, RNNObservation, chex.PRNGKey], Tuple[HiddenState, chex.Array]
+    [FrozenDict, HiddenState, RNNObservation,
+        chex.PRNGKey], Tuple[HiddenState, chex.Array]
 ]
-RecCriticApply = Callable[[FrozenDict, HiddenState, RNNObservation], Tuple[HiddenState, Value]]
+RecCriticApply = Callable[[FrozenDict, HiddenState,
+                           RNNObservation], Tuple[HiddenState, Value]]

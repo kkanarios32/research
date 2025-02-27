@@ -26,19 +26,16 @@ class ContrastiveTorso(nn.Module):
             1/3, "fan_in", "uniform")
         normalize = nn.LayerNorm() if self.use_layer_norm else (lambda x: x)
 
-        # Start of net
-        residual_stream = jnp.zeros((x.shape[0], self.width))
-
+        y = x.copy()
         # Main body
         for i in range(self.num_blocks):
             for j in range(self.block_size):
                 x = nn.swish(
                     normalize(nn.Dense(self.width, kernel_init=lecun_uniform)(x)))
-            x += residual_stream
-            residual_stream = x
 
         # Last layer mapping to representation dimension
         x = nn.Dense(self.output_size, kernel_init=lecun_uniform)(x)
+        del y
         return x
 
 
