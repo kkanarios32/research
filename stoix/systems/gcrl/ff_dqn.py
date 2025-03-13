@@ -8,12 +8,16 @@ import flax
 import hydra
 import jax
 import jax.numpy as jnp
+import navix as nx
 import optax
 from colorama import Fore, Style
 from flashbax.buffers.trajectory_buffer import BufferState
 from flax.core.frozen_dict import FrozenDict
 from jumanji.env import Environment
 from jumanji.types import TimeStep
+from jumanji.wrappers import AutoResetWrapper
+from navix import observations, rewards, terminations
+from navix.environments import DynamicObstacles
 from omegaconf import DictConfig, OmegaConf
 from rich.pretty import pprint
 
@@ -25,9 +29,10 @@ from stoix.base_types import (
     OffPolicyLearnerState,
     OnlineAndTarget,
 )
-from stoix.evaluator import evaluator_setup, get_distribution_act_fn
 from stoix.networks.base import FeedForwardActor as Actor
-from stoix.systems.q_learning.dqn_types import Transition
+from stoix.networks.inputs import ObservationGoalInput
+from stoix.systems.gcrl.evaluator import evaluator_setup, obstacle_act_fn
+from stoix.systems.gcrl.gcrl_types import QLearningTransition as Transition
 from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
@@ -35,7 +40,9 @@ from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import q_learning
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
-from stoix.wrappers.episode_metrics import get_final_step_metrics
+from stoix.wrappers.episode_metrics import RecordEpisodeMetrics, get_final_step_metrics
+from stoix.wrappers.navix import NavixGoalWrapper, NavixWrapper
+from stoix.wrappers.transforms import FlattenObservationWrapper
 
 
 def get_warmup_fn(
@@ -56,7 +63,9 @@ def get_warmup_fn(
             env_state, last_timestep, key = carry
             # SELECT ACTION
             key, policy_key = jax.random.split(key)
-            actor_policy = q_apply_fn(q_params.online, last_timestep.observation)
+            actor_policy = q_apply_fn(
+                q_params.online, last_timestep.observation, last_timestep.extras["goal"]
+            )
             action = actor_policy.sample(seed=policy_key)
 
             # STEP ENVIRONMENT
@@ -66,9 +75,10 @@ def get_warmup_fn(
             done = timestep.last().reshape(-1)
             info = timestep.extras["episode_metrics"]
             next_obs = timestep.extras["next_obs"]
+            goal = timestep.extras["goal"]
 
             transition = Transition(
-                last_timestep.observation, action, timestep.reward, done, next_obs, info
+                done, action, timestep.reward, last_timestep.observation, next_obs, goal, info
             )
 
             return (env_state, timestep, key), transition
@@ -112,7 +122,9 @@ def get_learner_fn(
 
             # SELECT ACTION
             key, policy_key = jax.random.split(key)
-            actor_policy = q_apply_fn(q_params.online, last_timestep.observation)
+            actor_policy = q_apply_fn(
+                q_params.online, last_timestep.observation, last_timestep.extras["goal"]
+            )
             action = actor_policy.sample(seed=policy_key)
 
             # STEP ENVIRONMENT
@@ -122,9 +134,10 @@ def get_learner_fn(
             done = timestep.last().reshape(-1)
             info = timestep.extras["episode_metrics"]
             next_obs = timestep.extras["next_obs"]
+            goal = timestep.extras["goal"]
 
             transition = Transition(
-                last_timestep.observation, action, timestep.reward, done, next_obs, info
+                done, action, timestep.reward, last_timestep.observation, next_obs, goal, info
             )
 
             learner_state = OffPolicyLearnerState(
@@ -139,7 +152,6 @@ def get_learner_fn(
 
         params, opt_states, buffer_state, key, env_state, last_timestep = learner_state
 
-        print(traj_batch.obs.agent_view.shape)
         # Add the trajectory to the buffer.
         buffer_state = buffer_add_fn(buffer_state, traj_batch)
 
@@ -152,8 +164,10 @@ def get_learner_fn(
                 transitions: Transition,
             ) -> jnp.ndarray:
 
-                q_tm1 = q_apply_fn(q_params, transitions.obs).preferences
-                q_t = q_apply_fn(target_q_params, transitions.next_obs).preferences
+                q_tm1 = q_apply_fn(q_params, transitions.obs, transitions.goal).preferences
+                q_t = q_apply_fn(
+                    target_q_params, transitions.next_obs, transitions.goal
+                ).preferences
 
                 # Cast and clip rewards.
                 discount = 1.0 - transitions.done.astype(jnp.float32)
@@ -282,14 +296,20 @@ def learner_setup(
         epsilon=config.system.training_epsilon,
     )
 
-    q_network = Actor(torso=q_network_torso, action_head=q_network_action_head)
+    q_network = Actor(
+        torso=q_network_torso, action_head=q_network_action_head, input_layer=ObservationGoalInput()
+    )
 
     eval_q_network_action_head = hydra.utils.instantiate(
         config.network.actor_network.action_head,
         action_dim=action_dim,
         epsilon=config.system.evaluation_epsilon,
     )
-    eval_q_network = Actor(torso=q_network_torso, action_head=eval_q_network_action_head)
+    eval_q_network = Actor(
+        torso=q_network_torso,
+        action_head=eval_q_network_action_head,
+        input_layer=ObservationGoalInput(),
+    )
 
     q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
     q_optim = optax.chain(
@@ -301,8 +321,11 @@ def learner_setup(
     init_x = env.observation_spec().generate_value()
     init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
 
+    init_goal = env.goal_spec().generate_value()
+    init_goal = jax.tree_util.tree_map(lambda x: x[None, ...], init_goal)
+
     # Initialise q params and optimiser state.
-    q_online_params = q_network.init(q_net_key, init_x)
+    q_online_params = q_network.init(q_net_key, init_x, init_goal)
     q_target_params = q_online_params
     q_opt_state = q_optim.init(q_online_params)
 
@@ -322,6 +345,7 @@ def learner_setup(
         reward=jnp.zeros((), dtype=float),
         done=jnp.zeros((), dtype=bool),
         next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
+        goal=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_goal),
         info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False},
     )
     assert config.system.total_buffer_size % n_devices == 0, (
@@ -431,7 +455,32 @@ def run_experiment(_config: DictConfig) -> float:
     ), "Number of updates per evaluation must be less than total number of updates."
 
     # Create the environments for train and eval.
-    env, eval_env = environments.make(config=config)
+    def make_gcrl_env(name):
+        env = nx.make(name)
+        eval_env = DynamicObstacles.create(
+            height=8,
+            width=8,
+            n_obstacles=2,
+            random_start=False,
+            observation_fn=observations.symbolic,
+            reward_fn=rewards.on_goal_reached,
+        )
+
+        env = NavixWrapper(env)
+        eval_env = NavixWrapper(eval_env)
+
+        env = NavixGoalWrapper(env)
+        eval_env = NavixGoalWrapper(eval_env)
+
+        env = AutoResetWrapper(env, next_obs_in_extras=True)
+        env = RecordEpisodeMetrics(env)
+
+        env = FlattenObservationWrapper(env)
+        eval_env = FlattenObservationWrapper(eval_env)
+
+        return env, eval_env
+
+    env, eval_env = make_gcrl_env("Navix-Empty-8x8-v0")
 
     # PRNG keys.
     key, key_e, q_net_key = jax.random.split(jax.random.PRNGKey(config.arch.seed), num=3)
@@ -443,7 +492,7 @@ def run_experiment(_config: DictConfig) -> float:
     evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = evaluator_setup(
         eval_env=eval_env,
         key_e=key_e,
-        eval_act_fn=get_distribution_act_fn(config, eval_q_network.apply),
+        eval_act_fn=obstacle_act_fn(config, eval_q_network.apply),
         params=learner_state.params.online,
         config=config,
     )
@@ -517,6 +566,7 @@ def run_experiment(_config: DictConfig) -> float:
         # Log the results of the evaluation.
         elapsed_time = time.time() - start_time
         episode_return = jnp.mean(evaluator_output.episode_metrics["episode_return"])
+        episode_return = 0
 
         steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
         evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
@@ -537,27 +587,28 @@ def run_experiment(_config: DictConfig) -> float:
         learner_state = learner_output.learner_state
 
     # Measure absolute metric.
-    if config.arch.absolute_metric:
-        start_time = time.time()
-
-        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
-        eval_keys = jnp.stack(eval_keys)
-        eval_keys = eval_keys.reshape(n_devices, -1)
-
-        evaluator_output = absolute_metric_evaluator(best_params, eval_keys)
-        jax.block_until_ready(evaluator_output)
-
-        elapsed_time = time.time() - start_time
-        t = int(steps_per_rollout * (eval_step + 1))
-        steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
-        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
-        logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.ABSOLUTE)
+    # if config.arch.absolute_metric:
+    #     start_time = time.time()
+    #
+    #     key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
+    #     eval_keys = jnp.stack(eval_keys)
+    #     eval_keys = eval_keys.reshape(n_devices, -1)
+    #
+    #     evaluator_output = absolute_metric_evaluator(best_params, eval_keys)
+    #     jax.block_until_ready(evaluator_output)
+    #
+    #     elapsed_time = time.time() - start_time
+    #     t = int(steps_per_rollout * (eval_step + 1))
+    #     steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
+    #     evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
+    #     logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.ABSOLUTE)
 
     # Stop the logger.
     logger.stop()
     # Record the performance for the final evaluation run. If the absolute metric is not
     # calculated, this will be the final evaluation run.
-    eval_performance = float(jnp.mean(evaluator_output.episode_metrics[config.env.eval_metric]))
+    # eval_performance = float(jnp.mean(evaluator_output.episode_metrics[config.env.eval_metric]))
+    eval_performance = 0
     return eval_performance
 
 

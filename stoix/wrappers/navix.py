@@ -7,11 +7,10 @@ from jumanji import specs
 from jumanji.specs import Array, DiscreteArray, Spec
 from jumanji.types import StepType, TimeStep, restart
 from jumanji.wrappers import Wrapper
+from navix.entities import Entities, Goal, Player
 from navix.environments.environment import Environment
 from navix.environments.environment import Timestep as NavixState
-from navix.entities import Entities
 from navix.grid import random_positions, room
-from navix.entities import Entities, Goal, Player
 
 from stoix.base_types import Observation
 
@@ -112,23 +111,27 @@ class NavixGoalWrapper(Wrapper):
 
         player_pos = state.navix_state.state.get_player().position
         grid = room(height=self.height, width=self.width)
-        goal_pos = random_positions(
-            key_2, grid, n=1, exclude=jnp.array([player_pos]))
+        goal_pos = random_positions(key_2, grid, n=1, exclude=jnp.array([player_pos]))
         # goal
         goal = Goal.create(position=goal_pos, probability=jnp.asarray(1.0))
+        # goal = Goal.create(position=jnp.asarray([2, 2]), probability=jnp.asarray(1.0))
         state.navix_state.state.set_goals(goal[None])
 
-        timestep.extras["goal"] = goal_pos
+        timestep.extras["goal"] = goal.position
         timestep.extras["player"] = player_pos
+        if Entities.BALL in state.navix_state.state.entities.keys():
+            timestep.extras["obstacles"] = state.navix_state.state.get_balls().position
+
         return state, timestep
 
     def step(self, state: NavixEnvState, action: chex.Array) -> Tuple[NavixEnvState, TimeStep]:
         next_state, timestep = self._env.step(state, action)
 
-        timestep.extras["goal"] = next_state.navix_state.state.get_goals(
-        ).position[0]
-        timestep.extras["player"] = next_state.navix_state.state.get_player(
-        ).position
+        timestep.extras["goal"] = next_state.navix_state.state.get_goals().position[0]
+        timestep.extras["player"] = next_state.navix_state.state.get_player().position
+
+        if Entities.BALL in state.navix_state.state.entities.keys():
+            timestep.extras["obstacles"] = next_state.navix_state.state.get_balls().position
         return next_state, timestep
 
     def reward_spec(self) -> specs.Array:
@@ -148,7 +151,7 @@ class NavixGoalWrapper(Wrapper):
         goal_max = [self._env.height, self._env.width]
         goal_spec = specs.BoundedArray(
             shape=(2,),
-            dtype=float,
+            dtype=int,
             minimum=goal_min,
             maximum=goal_max,
         )

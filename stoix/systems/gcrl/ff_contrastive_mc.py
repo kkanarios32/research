@@ -1,24 +1,22 @@
-import navix as nx
-import distrax
-from navix.entities import Entities
-from stoix.wrappers.navix import NavixWrapper, NavixGoalWrapper
-from stoix.systems.gcrl.envs.random_goals import RandomGoals
-import jax
-import jax.numpy as jnp
-from jumanji.env import Environment
-import chex
 import copy
 import time
-from typing import Any, Dict, Tuple, Callable
+from typing import Any, Callable, Dict, Tuple
 
+import chex
+import distrax
 import flashbax as fbx
 import flax
 import hydra
+import jax
+import jax.numpy as jnp
+import navix as nx
 import optax
 import rlax
 from colorama import Fore, Style
 from flax.core.frozen_dict import FrozenDict
 from jumanji.env import Environment
+from jumanji.wrappers import AutoResetWrapper
+from navix.entities import Entities
 from omegaconf import DictConfig, OmegaConf
 from rich.pretty import pprint
 
@@ -33,9 +31,15 @@ from stoix.base_types import (
 )
 from stoix.evaluator import evaluator_setup, get_distribution_act_fn
 from stoix.networks.base import ContrastiveNet as Net
+from stoix.networks.inputs import EmbeddingInput, ObservationActionInput
 from stoix.networks.torso import ContrastiveTorso as Torso
-from stoix.networks.inputs import ObservationActionInput, EmbeddingInput
-from stoix.systems.gcrl.gcrl_types import Transition, ContrastiveOptState, ContrastiveParams
+from stoix.systems.gcrl.buffer import flatten_crl_fn
+from stoix.systems.gcrl.envs.random_goals import RandomGoals
+from stoix.systems.gcrl.gcrl_types import (
+    ContrastiveOptState,
+    ContrastiveParams,
+    Transition,
+)
 from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
@@ -43,12 +47,10 @@ from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.multistep import batch_discounted_returns
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
-from stoix.wrappers.episode_metrics import get_final_step_metrics
-from stoix.wrappers.transforms import FlattenObservationWrapper
-from stoix.wrappers.episode_metrics import RecordEpisodeMetrics
-from stoix.systems.gcrl.buffer import flatten_crl_fn
-
+from stoix.wrappers.episode_metrics import RecordEpisodeMetrics, get_final_step_metrics
 from stoix.wrappers.gcrl import TrajectoryIdWrapper
+from stoix.wrappers.navix import NavixGoalWrapper, NavixWrapper
+from stoix.wrappers.transforms import FlattenObservationWrapper
 
 
 def log_softmax(logits, axis, resubs):
@@ -63,12 +65,9 @@ def log_softmax(logits, axis, resubs):
 
 def compute_energy(energy_fn, sa_repr, g_repr):
     if energy_fn == "l2":
-        logits = - \
-            jnp.sqrt(
-                jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
+        logits = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
     elif energy_fn == "l1":
-        logits = - \
-            jnp.sum(jnp.abs(sa_repr - g_repr), axis=-1)
+        logits = -jnp.sum(jnp.abs(sa_repr - g_repr), axis=-1)
     elif energy_fn == "dot":
         logits = jnp.einsum("bjk,bjk->bj", sa_repr, g_repr)
     else:
@@ -93,7 +92,7 @@ def get_learner_fn(
     env: Environment,
     apply_fns: Tuple[CriticApply, CriticApply, CriticApply],
     update_fns: Tuple[optax.TransformUpdateFn, optax.TransformUpdateFn],
-    buffer_fns: Tuple[Callable, Callable]
+    buffer_fns: Tuple[Callable, Callable],
 ) -> LearnerFn[OffPolicyLearnerState]:
     """Get the learner function."""
 
@@ -116,10 +115,10 @@ def get_learner_fn(
 
             print("goal ", last_timestep.extras["goal"])
             action = actor_apply_fn(
-                params, last_timestep.observation, last_timestep.extras["goal"], policy_key)
+                params, last_timestep.observation, last_timestep.extras["goal"], policy_key
+            )
             # STEP ENVIRONMENT
-            env_state, timestep = jax.vmap(
-                env.step, in_axes=(0, 0))(env_state, action)
+            env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
 
             # LOG EPISODE METRICS
             done = timestep.last().reshape(-1)
@@ -129,19 +128,16 @@ def get_learner_fn(
             info = timestep.extras["episode_metrics"]
 
             transition = Transition(
-                done, action,
-                timestep.reward, timestep.observation,
-                player_pos, goal, traj_id, info
+                done, action, timestep.reward, timestep.observation, player_pos, goal, traj_id, info
             )
 
             learner_state = OffPolicyLearnerState(
-                params, opt_states, buffer_state, key, env_state, timestep)
+                params, opt_states, buffer_state, key, env_state, timestep
+            )
             return learner_state, transition
 
         # STEP ENVIRONMENT FOR ROLLOUT LENGTH
-        learner_state, traj_batch = jax.lax.scan(
-            _env_step, learner_state, None, 32
-        )
+        learner_state, traj_batch = jax.lax.scan(_env_step, learner_state, None, 32)
 
         params, opt_states, buffer_state, key, env_state, last_timestep = learner_state
 
@@ -152,20 +148,15 @@ def get_learner_fn(
             """Calculate the critic loss."""
             # RERUN NETWORK
             sa_params, g_params = params
-            sa_repr = sa_apply_fn(
-                sa_params, transitions.obs, transitions.action)
-            g_repr = g_apply_fn(
-                g_params, transitions.goal)
+            sa_repr = sa_apply_fn(sa_params, transitions.obs, transitions.action)
+            g_repr = g_apply_fn(g_params, transitions.goal)
 
-            print(f"g dim: {g_repr.shape}")
-            print(f"sa dim: {sa_repr.shape}")
             contrastive_loss_fn_name = ""
             resubs = True
 
             # Compute energy and loss
             logits = compute_energy(energy_fn_name, sa_repr, g_repr)
-            loss, l_align, l_unif = compute_loss(
-                contrastive_loss_fn_name, logits, resubs)
+            loss, l_align, l_unif = compute_loss(contrastive_loss_fn_name, logits, resubs)
 
             logsumexp_penalty = 0
             l2_penalty = 0
@@ -186,8 +177,7 @@ def get_learner_fn(
                 loss += logsumexp_penalty * jnp.mean(logsumexp**2)
 
             if l2_penalty > 0:
-                l2_loss = l2_penalty * \
-                    (jnp.mean(sa_repr**2) + jnp.mean(g_repr**2))
+                l2_loss = l2_penalty * (jnp.mean(sa_repr**2) + jnp.mean(g_repr**2))
                 loss += l2_loss
             else:
                 l2_loss = 0
@@ -198,16 +188,12 @@ def get_learner_fn(
         key, sample_key, flatten_key = jax.random.split(key, 3)
         traj_batch = buffer_sample_fn(buffer_state, sample_key)
 
-        flatten_keys = jax.random.split(
-            flatten_key, config.system.total_batch_size)
-        traj_batch = vmap_flatten_crl_fn(
-            config, env, traj_batch.experience, flatten_keys)
+        flatten_keys = jax.random.split(flatten_key, config.system.total_batch_size)
+        traj_batch = vmap_flatten_crl_fn(config, env, traj_batch.experience, flatten_keys)
 
         # CALCULATE CRITIC LOSS
         critic_grad_fn = jax.grad(_critic_loss_fn, has_aux=True)
-        critic_grads, critic_loss_info = critic_grad_fn(
-            params, traj_batch, "dot"
-        )
+        critic_grads, critic_loss_info = critic_grad_fn(params, traj_batch, "dot")
 
         # Compute the parallel mean (pmean) over the batch.
         # This calculation is inspired by the Anakin architecture demo notebook.
@@ -224,10 +210,8 @@ def get_learner_fn(
         )
 
         # UPDATE CRITIC PARAMS AND OPTIMISER STATE
-        critic_updates, critic_new_opt_state = critic_update_fn(
-            critic_grads, opt_states)
-        critic_new_params = optax.apply_updates(
-            params, critic_updates)
+        critic_updates, critic_new_opt_state = critic_update_fn(critic_grads, opt_states)
+        critic_new_params = optax.apply_updates(params, critic_updates)
 
         # PACK LOSS INFO
         loss_info = {
@@ -245,8 +229,7 @@ def get_learner_fn(
         learner_state: OffPolicyLearnerState,
     ) -> AnakinExperimentOutput[OffPolicyLearnerState]:
 
-        batched_update_step = jax.vmap(
-            _update_step, in_axes=(0, None), axis_name="batch")
+        batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
 
         learner_state, (episode_info, loss_info) = jax.lax.scan(
             batched_update_step, learner_state, None, config.arch.num_updates_per_eval
@@ -260,9 +243,7 @@ def get_learner_fn(
     return learner_fn
 
 
-def learner_setup(
-    env: Environment, keys: chex.Array, config: DictConfig
-):
+def learner_setup(env: Environment, keys: chex.Array, config: DictConfig):
     """Initialise learner_fn, network, optimiser, environment and states."""
     # Get available TPU cores.
     n_devices = len(jax.devices())
@@ -275,8 +256,7 @@ def learner_setup(
     # PRNG keys.
     key, sa_key, g_key = keys
 
-    sa_network = Net(torso=Torso(
-        64), input_layer=ObservationActionInput())
+    sa_network = Net(torso=Torso(64), input_layer=ObservationActionInput())
     g_network = Net(torso=Torso(64), input_layer=EmbeddingInput())
 
     lr = make_learning_rate(config.system.critic_lr, config, 1, 1)
@@ -304,8 +284,7 @@ def learner_setup(
         reward=jnp.zeros((), dtype=float),
         traj_id=jnp.zeros((), dtype=int),
         done=jnp.zeros((), dtype=bool),
-        info={"episode_return": 0.0, "episode_length": 0,
-              "is_terminal_step": False},
+        info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False},
     )
     buffer_fn = fbx.make_trajectory_buffer(
         add_batch_size=config.arch.total_num_envs,
@@ -336,22 +315,20 @@ def learner_setup(
     g_network_apply_fn = g_network.apply
 
     actions = jnp.arange(num_actions)[..., None]
-    actions = jnp.broadcast_to(
-        actions, (num_actions, config.arch.num_envs))
+    actions = jnp.broadcast_to(actions, (num_actions, config.arch.num_envs))
     # print(f"broadcast actions: {actions.shape}")
 
     @jax.jit
     def policy_apply_fn(params, observation, goal, seed):
         sa_params, g_params = params
-        vmap_sa = jax.vmap(sa_network_apply_fn, in_axes=(
-            None, None, 0))
+        vmap_sa = jax.vmap(sa_network_apply_fn, in_axes=(None, None, 0))
         sa_repr = vmap_sa(sa_params, observation, actions)
         g_repr = g_network_apply_fn(g_params, goal)
         print(f"sa output repr {sa_repr}")
         print(f"goal output repr {g_repr}")
         logits = jnp.einsum("ijk,jk->ji", sa_repr, g_repr)
         print(f"logits: {logits}")
-        return distrax.EpsilonGreedy(preferences=logits, epsilon=.9).sample(seed=seed)
+        return distrax.EpsilonGreedy(preferences=logits, epsilon=0.9).sample(seed=seed)
 
     # Pack apply and update functions.
     apply_fns = (sa_network_apply_fn, g_network_apply_fn, policy_apply_fn)
@@ -369,10 +346,11 @@ def learner_setup(
     )
     #
 
-    def reshape_states(x): return x.reshape(
-        (n_devices, config.arch.update_batch_size,
-         config.arch.num_envs) + x.shape[1:]
-    )
+    def reshape_states(x):
+        return x.reshape(
+            (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
+        )
+
     # (devices, update batch size, num_envs, ...)
     env_states = jax.tree_util.tree_map(reshape_states, env_states)
     timesteps = jax.tree_util.tree_map(reshape_states, timesteps)
@@ -390,29 +368,30 @@ def learner_setup(
     #
     # Define params to be replicated across devices and batches.
     key, step_key = jax.random.split(key)
-    step_keys = jax.random.split(
-        step_key, n_devices * config.arch.update_batch_size)
+    step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
     #
 
-    def reshape_keys(x): return x.reshape(
-        (n_devices, config.arch.update_batch_size) + x.shape[1:])
+    def reshape_keys(x):
+        return x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
+
     step_keys = reshape_keys(jnp.stack(step_keys))
     #
     replicate_learner = (params, opt_state, buffer_states)
 
     # Duplicate learner for update_batch_size.
-    def broadcast(x): return jnp.broadcast_to(
-        x, (config.arch.update_batch_size,) + x.shape)
+    def broadcast(x):
+        return jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
+
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
-    replicate_learner = flax.jax_utils.replicate(
-        replicate_learner, devices=jax.devices())
+    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
 
     # Initialise learner state.
     params, opt_states, buffer_states = replicate_learner
     init_learner_state = OffPolicyLearnerState(
-        params, opt_states, buffer_states, step_keys, env_states, timesteps)
+        params, opt_states, buffer_states, step_keys, env_states, timesteps
+    )
 
     return learn, init_learner_state, policy_apply_fn
 
@@ -432,12 +411,13 @@ def train(_config):
         env = NavixWrapper(env)
         env = FlattenObservationWrapper(env)
         env = NavixGoalWrapper(env)
+        env = AutoResetWrapper(env)
         env = RecordEpisodeMetrics(env)
         env = TrajectoryIdWrapper(env)
         return env
 
-    env = make_gcrl_env("Navix-Empty-5x5-v0")
-    eval_env = make_gcrl_env("Navix-Empty-5x5-v0")
+    env = make_gcrl_env("Navix-Empty-6x6-v0")
+    eval_env = make_gcrl_env("Navix-Empty-6x6-v0")
 
     key = jax.random.PRNGKey(0)
     key_e, *keys = jax.random.split(key, 4)
@@ -478,8 +458,7 @@ def train(_config):
         elapsed_time = time.time() - start_time
         t = int(32 * (eval_step + 1))
 
-        episode_metrics, ep_completed = get_final_step_metrics(
-            learner_output.episode_metrics)
+        episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
         episode_metrics["steps_per_second"] = 32 / elapsed_time
 
         # Separately log timesteps, actoring metrics and training metrics.

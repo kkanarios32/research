@@ -2,7 +2,7 @@
 actor_network:
   pre_torso:
     _target_: stoix.networks.torso.MLPTorso
-    layer_sizes: [256, 256]
+    layer_sizes: [1024, 1024]
     use_layer_norm: False
     activation: silu
   action_head:

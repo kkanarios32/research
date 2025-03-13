@@ -10,7 +10,7 @@ import numpy as np
 from flax import linen as nn
 
 from stoix.base_types import Observation, RNNObservation
-from stoix.networks.inputs import ObservationInput, ObservationGoalInput
+from stoix.networks.inputs import ObservationGoalInput, ObservationInput
 from stoix.networks.utils import parse_rnn_cell
 
 
@@ -33,9 +33,9 @@ class FeedForwardActor(nn.Module):
     input_layer: nn.Module = ObservationInput()
 
     @nn.compact
-    def __call__(self, observation: Observation) -> distrax.DistributionLike:
+    def __call__(self, *inputs) -> distrax.DistributionLike:
 
-        obs_embedding = self.input_layer(observation)
+        obs_embedding = self.input_layer(*inputs)
 
         obs_embedding = self.torso(obs_embedding)
 
@@ -111,11 +111,13 @@ class ScannedRNN(nn.Module):
         """Applies the module."""
         ins, resets = x
 
-        def hidden_state_reset_fn(reset_state, current_state): return jnp.where(
-            resets[:, np.newaxis],
-            reset_state,
-            current_state,
-        )
+        def hidden_state_reset_fn(reset_state, current_state):
+            return jnp.where(
+                resets[:, np.newaxis],
+                reset_state,
+                current_state,
+            )
+
         rnn_state = jax.tree_util.tree_map(
             hidden_state_reset_fn,
             self.initialize_carry(ins.shape[0]),
@@ -206,6 +208,5 @@ def chained_torsos(torso_cfgs: List[Dict[str, Any]]) -> nn.Module:
         torso_cfgs: List of dictionaries containing the configuration for each torso.
             These configs should use the same format as the individual torso configs."""
 
-    torso_modules = [hydra.utils.instantiate(
-        torso_cfg) for torso_cfg in torso_cfgs]
+    torso_modules = [hydra.utils.instantiate(torso_cfg) for torso_cfg in torso_cfgs]
     return CompositeNetwork(torso_modules)

@@ -156,8 +156,9 @@ class NeptuneLogger(BaseLogger):
         # Store json path for uploading json data to Neptune.
         json_exp_path = get_logger_path(cfg, "json")
         self.json_file_path = os.path.join(
-            cfg.logger.base_exp_path, f"""{
-                json_exp_path}/{unique_token}/metrics.json"""
+            cfg.logger.base_exp_path,
+            f"""{
+                json_exp_path}/{unique_token}/metrics.json""",
         )
         self.unique_token = unique_token
         self.upload_json_data = cfg.logger.kwargs.upload_json_data
@@ -185,8 +186,10 @@ class NeptuneLogger(BaseLogger):
         with zipfile.ZipFile(zip_file_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             zipf.write(self.json_file_path)
 
-        self.logger[f"""metrics/metrics_{
-            self.unique_token}"""].upload(zip_file_path)
+        self.logger[
+            f"""metrics/metrics_{
+            self.unique_token}"""
+        ].upload(zip_file_path)
 
 
 class WandBLogger(BaseLogger):
@@ -196,16 +199,16 @@ class WandBLogger(BaseLogger):
         tags = list(cfg.logger.kwargs.tags)
         project = cfg.logger.kwargs.project
 
-        wandb.init(project=project, tags=tags,
-                   config=stringify_unsupported(cfg))
+        wandb.init(project=project, tags=tags, config=stringify_unsupported(cfg))
 
         self.detailed_logging = cfg.logger.kwargs.detailed_logging
 
         # Store json path for uploading json data to Neptune.
         json_exp_path = get_logger_path(cfg, "json")
         self.json_file_path = os.path.join(
-            cfg.logger.base_exp_path, f"""{
-                json_exp_path}/{unique_token}/metrics.json"""
+            cfg.logger.base_exp_path,
+            f"""{
+                json_exp_path}/{unique_token}/metrics.json""",
         )
         self.unique_token = unique_token
         self.upload_json_data = cfg.logger.kwargs.upload_json_data
@@ -242,8 +245,11 @@ class TensorboardLogger(BaseLogger):
 
     def __init__(self, cfg: DictConfig, unique_token: str) -> None:
         tb_exp_path = get_logger_path(cfg, "tensorboard")
-        tb_logs_path = os.path.join(cfg.logger.base_exp_path, f"""{
-                                    tb_exp_path}/{unique_token}""")
+        tb_logs_path = os.path.join(
+            cfg.logger.base_exp_path,
+            f"""{
+                                    tb_exp_path}/{unique_token}""",
+        )
 
         self.logger = tensorboard_logger.Logger(tb_logs_path)
         self.log = self.logger.log_value
@@ -261,8 +267,11 @@ class JsonLogger(BaseLogger):
 
     def __init__(self, cfg: DictConfig, unique_token: str) -> None:
         json_exp_path = get_logger_path(cfg, "json")
-        json_logs_path = os.path.join(cfg.logger.base_exp_path, f"""{
-                                      json_exp_path}/{unique_token}""")
+        json_logs_path = os.path.join(
+            cfg.logger.base_exp_path,
+            f"""{
+                                      json_exp_path}/{unique_token}""",
+        )
 
         # if a custom path is specified, use that instead
         if cfg.logger.kwargs.json_path is not None:
@@ -294,8 +303,7 @@ class JsonLogger(BaseLogger):
 
         # We only want to log evaluation metrics to the json logger
         if event == LogEvent.ABSOLUTE or event == LogEvent.EVAL:
-            self.logger.write(step, key, value, eval_step,
-                              event == LogEvent.ABSOLUTE)
+            self.logger.write(step, key, value, eval_step, event == LogEvent.ABSOLUTE)
 
 
 class ConsoleLogger(BaseLogger):
@@ -315,8 +323,7 @@ class ConsoleLogger(BaseLogger):
         self.logger.handlers = []
 
         ch = logging.StreamHandler()
-        formatter = logging.Formatter(
-            f"{Fore.CYAN}{Style.BRIGHT}%(message)s", "%H:%M:%S")
+        formatter = logging.Formatter(f"{Fore.CYAN}{Style.BRIGHT}%(message)s", "%H:%M:%S")
         ch.setFormatter(formatter)
         self.logger.addHandler(ch)
 
@@ -341,8 +348,15 @@ class ConsoleLogger(BaseLogger):
         # Replace underscores with spaces and capitalise keys.
         keys = [k.replace("_", " ").capitalize() for k in data.keys()]
         # Round values to 3 decimal places if they are floats.
-        values = [v if isinstance(v, int) else f"""{
-            float(v):.3f}""" for v in data.values()]
+        values = [
+            (
+                v
+                if isinstance(v, int)
+                else f"""{
+            float(v):.3f}"""
+            )
+            for v in data.values()
+        ]
         log_str = " | ".join([f"{k}: {v}" for k, v in zip(keys, values)])
 
         self.logger.info(

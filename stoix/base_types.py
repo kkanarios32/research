@@ -15,6 +15,8 @@ else:
 
 
 Action: TypeAlias = chex.Array
+Goal: TypeAlias = chex.Array
+Obstacle: TypeAlias = chex.Array
 Value: TypeAlias = chex.Array
 Done: TypeAlias = chex.Array
 Truncated: TypeAlias = chex.Array
@@ -71,6 +73,12 @@ class EvalState(NamedTuple):
     timestep: TimeStep
     step_count: chex.Array
     episode_return: chex.Array
+
+
+class GoalEvalState(NamedTuple):
+    eval_state: EvalState
+    q_val: chex.Array
+    penalty: chex.Array
 
 
 class RNNEvalState(NamedTuple):
@@ -185,14 +193,15 @@ class EvaluationOutput(NamedTuple, Generic[StoixState]):
 
 RNNObservation: TypeAlias = Tuple[Observation, Done]
 LearnerFn = Callable[[StoixState], AnakinExperimentOutput[StoixState]]
-SebulbaLearnerFn = Callable[[
-    StoixState, StoixTransition], SebulbaExperimentOutput[StoixState]]
+SebulbaLearnerFn = Callable[[StoixState, StoixTransition], SebulbaExperimentOutput[StoixState]]
 EvalFn = Callable[[FrozenDict, chex.PRNGKey], EvaluationOutput[StoixState]]
 SebulbaEvalFn = Callable[[FrozenDict, chex.PRNGKey], Dict[str, chex.Array]]
 
 ActorApply = Callable[..., DistributionLike]
 
 ActFn = Callable[[FrozenDict, Observation, chex.PRNGKey], chex.Array]
+GoalActFn = Callable[[FrozenDict, Observation, Goal, chex.PRNGKey], chex.Array]
+ObstActFn = Callable[[FrozenDict, Observation, Goal, Obstacle, chex.PRNGKey], chex.Array]
 CriticApply = Callable[[FrozenDict, Observation], Value]
 DistributionCriticApply = Callable[[FrozenDict, Observation], DistributionLike]
 ContinuousQApply = Callable[[FrozenDict, Observation, Action], Value]
@@ -201,8 +210,6 @@ RecActorApply = Callable[
     [FrozenDict, HiddenState, RNNObservation], Tuple[HiddenState, DistributionLike]
 ]
 RecActFn = Callable[
-    [FrozenDict, HiddenState, RNNObservation,
-        chex.PRNGKey], Tuple[HiddenState, chex.Array]
+    [FrozenDict, HiddenState, RNNObservation, chex.PRNGKey], Tuple[HiddenState, chex.Array]
 ]
-RecCriticApply = Callable[[FrozenDict, HiddenState,
-                           RNNObservation], Tuple[HiddenState, Value]]
+RecCriticApply = Callable[[FrozenDict, HiddenState, RNNObservation], Tuple[HiddenState, Value]]
