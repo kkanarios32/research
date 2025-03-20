@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 tests
+wandb
 cuda-*
 node_modules
 *.json

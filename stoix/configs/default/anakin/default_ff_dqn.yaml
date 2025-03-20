@@ -3,7 +3,7 @@ defaults:
   - arch: anakin
   - system: q_learning/ff_dqn
   - network: mlp_dqn
-  - env: navix/empty_8x8
+  - env: navix/dynamic_obstacle_8x8
   - _self_
 
 hydra:
