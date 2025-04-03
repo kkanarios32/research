@@ -1,0 +1,11 @@
+defaults:
+  - logger: base_logger
+  - arch: anakin
+  - system: gcrl/mcts_gcrl
+  - network: mlp_dqn
+  - env: navix/dynamic_obstacle_8x8
+  - _self_
+
+hydra:
+  searchpath:
+    - /home/kellen/Projects/phd_thesis/research/stoix/configs

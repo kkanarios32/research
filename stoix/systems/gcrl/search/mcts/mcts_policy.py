@@ -4,12 +4,12 @@ from typing import Any, Optional
 import chex
 import jax
 import jax.numpy as jnp
-import mctx
-import mctx._src.qtransforms as qtransforms
-from flax.core import FrozenDict
-from mctx import search
-from mctx._src import tree as tree_lib
-from mctx._src.base import PolicyOutput, QTransform
+
+import stoix.systems.gcrl.search.mcts.base as base
+import stoix.systems.gcrl.search.mcts.qtransform as qtransforms
+from stoix.systems.gcrl.search.mcts import tree as tree_lib
+from stoix.systems.gcrl.search.mcts.base import PolicyOutput, QTransform
+from stoix.systems.gcrl.search.mcts.search import search
 
 Params = Any
 
@@ -32,23 +32,27 @@ def action_selection(
     tree: tree_lib.Tree,
     node_index: chex.Numeric,
     depth: chex.Numeric,
+    pb_c_init: float = 1.25,
+    pb_c_base: float = 19652.0,
+    pb_o: float = 500.0,
     *,
     qtransform: QTransform = qtransforms.qtransform_by_parent_and_siblings,
 ) -> chex.Array:
     visit_counts = tree.children_visits[node_index]
     node_visit = tree.node_visits[node_index]
-    # pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.0) / pb_c_base)
+    obstacle_values = tree.obstacle_values[node_index]
+    pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.0) / pb_c_base)
     prior_logits = tree.children_prior_logits[node_index]
     prior_probs = jax.nn.softmax(prior_logits)
-    # policy_score = jnp.sqrt(node_visit) * pb_c * prior_probs / (visit_counts + 1)
-    policy_score = jnp.sqrt(node_visit) * prior_probs / (visit_counts + 1)
+    policy_score = jnp.sqrt(node_visit) * pb_c * prior_probs / (visit_counts + 1)
     chex.assert_shape([node_index, node_visit], ())
     chex.assert_equal_shape([prior_probs, visit_counts, policy_score])
     value_score = qtransform(tree, node_index)
+    obstacle_penalty = jnp.sqrt(node_visit) * obstacle_values / (visit_counts + 1)
 
     # Add tiny bit of randomness for tie break
     node_noise_score = 1e-7 * jax.random.uniform(rng_key, (tree.num_actions,))
-    to_argmax = value_score + policy_score + node_noise_score
+    to_argmax = value_score + policy_score + node_noise_score - obstacle_penalty
 
     # Masking the invalid actions at the root.
     return jnp.argmax(to_argmax)
@@ -57,16 +61,16 @@ def action_selection(
 def safe_policy(
     params: Params,
     rng_key: chex.PRNGKey,
-    root: mctx.RootFnOutput,
-    recurrent_fn: mctx.RecurrentFn,
+    root: base.RootFnOutput,
+    recurrent_fn: base.RecurrentFn,
     num_simulations: int,
     invalid_actions: Optional[chex.Array] = None,
     max_depth: Optional[int] = None,
-    loop_fn: mctx.LoopFn = jax.lax.fori_loop,
+    loop_fn: base.LoopFn = jax.lax.fori_loop,
     *,
     qtransform: QTransform = qtransforms.qtransform_by_parent_and_siblings,
     temperature: chex.Numeric = 1.0,
-) -> mctx.PolicyOutput[None]:
+) -> base.PolicyOutput[None]:
     """Runs MuZero search and returns the `PolicyOutput`.
 
     In the shape descriptions, `B` denotes the batch dimension.
@@ -125,6 +129,10 @@ def safe_policy(
     # Sampling the proposed action proportionally to the visit counts.
     summary = search_tree.summary()
     action_weights = summary.visit_probs
-    action_logits = _apply_temperature(_get_logits_from_probs(action_weights), temperature)
+    action_logits = _apply_temperature(
+        _get_logits_from_probs(action_weights), temperature
+    )
     action = jax.random.categorical(rng_key, action_logits)
-    return PolicyOutput(action=action, action_weights=action_weights, search_tree=search_tree)
+    return PolicyOutput(
+        action=action, action_weights=action_weights, search_tree=search_tree
+    )

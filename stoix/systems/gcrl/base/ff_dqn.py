@@ -16,7 +16,7 @@ from flax.core.frozen_dict import FrozenDict
 from jumanji.env import Environment
 from jumanji.types import TimeStep
 from jumanji.wrappers import AutoResetWrapper
-from navix import observations, rewards, terminations
+from navix import observations, rewards
 from navix.environments import DynamicObstacles
 from omegaconf import DictConfig, OmegaConf
 from rich.pretty import pprint
@@ -33,14 +33,13 @@ from stoix.networks.base import FeedForwardActor as Actor
 from stoix.networks.inputs import ObservationGoalInput
 from stoix.systems.gcrl.evaluator import evaluator_setup, obstacle_act_fn
 from stoix.systems.gcrl.gcrl_types import QLearningTransition as Transition
-from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import q_learning
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
-from stoix.wrappers.episode_metrics import RecordEpisodeMetrics, get_final_step_metrics
+from stoix.wrappers.episode_metrics import get_final_step_metrics
 from stoix.wrappers.navix import NavixGoalWrapper, NavixWrapper
 from stoix.wrappers.transforms import FlattenObservationWrapper
 
@@ -53,7 +52,10 @@ def get_warmup_fn(
     config: DictConfig,
 ) -> Callable:
     def warmup(
-        env_states: LogEnvState, timesteps: TimeStep, buffer_states: BufferState, keys: chex.PRNGKey
+        env_states: LogEnvState,
+        timesteps: TimeStep,
+        buffer_states: BufferState,
+        keys: chex.PRNGKey,
     ) -> Tuple[LogEnvState, TimeStep, BufferState, chex.PRNGKey]:
         def _env_step(
             carry: Tuple[LogEnvState, TimeStep, chex.PRNGKey], _: Any
@@ -78,7 +80,13 @@ def get_warmup_fn(
             goal = timestep.extras["goal"]
 
             transition = Transition(
-                done, action, timestep.reward, last_timestep.observation, next_obs, goal, info
+                done,
+                action,
+                timestep.reward,
+                last_timestep.observation,
+                next_obs,
+                goal,
+                info,
             )
 
             return (env_state, timestep, key), transition
@@ -118,7 +126,9 @@ def get_learner_fn(
             learner_state: OffPolicyLearnerState, _: Any
         ) -> Tuple[OffPolicyLearnerState, Transition]:
             """Step the environment."""
-            q_params, opt_states, buffer_state, key, env_state, last_timestep = learner_state
+            q_params, opt_states, buffer_state, key, env_state, last_timestep = (
+                learner_state
+            )
 
             # SELECT ACTION
             key, policy_key = jax.random.split(key)
@@ -137,7 +147,13 @@ def get_learner_fn(
             goal = timestep.extras["goal"]
 
             transition = Transition(
-                done, action, timestep.reward, last_timestep.observation, next_obs, goal, info
+                done,
+                action,
+                timestep.reward,
+                last_timestep.observation,
+                next_obs,
+                goal,
+                info,
             )
 
             learner_state = OffPolicyLearnerState(
@@ -163,8 +179,9 @@ def get_learner_fn(
                 target_q_params: FrozenDict,
                 transitions: Transition,
             ) -> jnp.ndarray:
-
-                q_tm1 = q_apply_fn(q_params, transitions.obs, transitions.goal).preferences
+                q_tm1 = q_apply_fn(
+                    q_params, transitions.obs, transitions.goal
+                ).preferences
                 q_t = q_apply_fn(
                     target_q_params, transitions.next_obs, transitions.goal
                 ).preferences
@@ -173,7 +190,9 @@ def get_learner_fn(
                 discount = 1.0 - transitions.done.astype(jnp.float32)
                 d_t = (discount * config.system.gamma).astype(jnp.float32)
                 r_t = jnp.clip(
-                    transitions.reward, -config.system.max_abs_reward, config.system.max_abs_reward
+                    transitions.reward,
+                    -config.system.max_abs_reward,
+                    config.system.max_abs_reward,
                 ).astype(jnp.float32)
                 a_tm1 = transitions.action
 
@@ -213,8 +232,12 @@ def get_learner_fn(
             # This calculation is inspired by the Anakin architecture demo notebook.
             # available at https://tinyurl.com/26tdzs5x
             # This pmean could be a regular mean as the batch axis is on the same device.
-            q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="batch")
-            q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="device")
+            q_grads, q_loss_info = jax.lax.pmean(
+                (q_grads, q_loss_info), axis_name="batch"
+            )
+            q_grads, q_loss_info = jax.lax.pmean(
+                (q_grads, q_loss_info), axis_name="device"
+            )
 
             # UPDATE Q PARAMS AND OPTIMISER STATE
             q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states)
@@ -260,7 +283,9 @@ def get_learner_fn(
 
         """
 
-        batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
+        batched_update_step = jax.vmap(
+            _update_step, in_axes=(0, None), axis_name="batch"
+        )
 
         learner_state, (episode_info, loss_info) = jax.lax.scan(
             batched_update_step, learner_state, None, config.arch.num_updates_per_eval
@@ -297,7 +322,9 @@ def learner_setup(
     )
 
     q_network = Actor(
-        torso=q_network_torso, action_head=q_network_action_head, input_layer=ObservationGoalInput()
+        torso=q_network_torso,
+        action_head=q_network_action_head,
+        input_layer=ObservationGoalInput(),
     )
 
     eval_q_network_action_head = hydra.utils.instantiate(
@@ -389,7 +416,8 @@ def learner_setup(
 
     def reshape_states(x: chex.Array) -> chex.Array:
         return x.reshape(
-            (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
+            (n_devices, config.arch.update_batch_size, config.arch.num_envs)
+            + x.shape[1:]
         )
 
     # (devices, update batch size, num_envs, ...)
@@ -410,7 +438,9 @@ def learner_setup(
     # Define params to be replicated across devices and batches.
     key, step_key, warmup_key = jax.random.split(key, num=3)
     step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
-    warmup_keys = jax.random.split(warmup_key, n_devices * config.arch.update_batch_size)
+    warmup_keys = jax.random.split(
+        warmup_key, n_devices * config.arch.update_batch_size
+    )
 
     def reshape_keys(x: chex.Array) -> chex.Array:
         return x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
@@ -427,7 +457,9 @@ def learner_setup(
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
-    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
+    replicate_learner = flax.jax_utils.replicate(
+        replicate_learner, devices=jax.devices()
+    )
 
     # Initialise learner state.
     params, opt_states, buffer_states = replicate_learner
@@ -450,9 +482,9 @@ def run_experiment(_config: DictConfig) -> float:
     n_devices = len(jax.devices())
     config.num_devices = n_devices
     config = check_total_timesteps(config)
-    assert (
-        config.arch.num_updates >= config.arch.num_evaluation
-    ), "Number of updates per evaluation must be less than total number of updates."
+    assert config.arch.num_updates >= config.arch.num_evaluation, (
+        "Number of updates per evaluation must be less than total number of updates."
+    )
 
     # Create the environments for train and eval.
     def make_gcrl_env(name):
@@ -460,7 +492,7 @@ def run_experiment(_config: DictConfig) -> float:
         eval_env = DynamicObstacles.create(
             height=8,
             width=8,
-            n_obstacles=2,
+            n_obstacles=1,
             random_start=False,
             observation_fn=observations.symbolic,
             reward_fn=rewards.on_goal_reached,
@@ -473,7 +505,6 @@ def run_experiment(_config: DictConfig) -> float:
         eval_env = NavixGoalWrapper(eval_env)
 
         env = AutoResetWrapper(env, next_obs_in_extras=True)
-        env = RecordEpisodeMetrics(env)
 
         env = FlattenObservationWrapper(env)
         eval_env = FlattenObservationWrapper(eval_env)
@@ -483,7 +514,9 @@ def run_experiment(_config: DictConfig) -> float:
     env, eval_env = make_gcrl_env("Navix-Empty-8x8-v0")
 
     # PRNG keys.
-    key, key_e, q_net_key = jax.random.split(jax.random.PRNGKey(config.arch.seed), num=3)
+    key, key_e, q_net_key = jax.random.split(
+        jax.random.PRNGKey(config.arch.seed), num=3
+    )
 
     # Setup learner.
     learn, eval_q_network, learner_state = learner_setup(env, (key, q_net_key), config)
@@ -498,7 +531,9 @@ def run_experiment(_config: DictConfig) -> float:
     )
 
     # Calculate number of updates per evaluation.
-    config.arch.num_updates_per_eval = config.arch.num_updates // config.arch.num_evaluation
+    config.arch.num_updates_per_eval = (
+        config.arch.num_updates // config.arch.num_evaluation
+    )
     steps_per_rollout = (
         n_devices
         * config.arch.num_updates_per_eval
@@ -535,12 +570,16 @@ def run_experiment(_config: DictConfig) -> float:
         # Log the results of the training.
         elapsed_time = time.time() - start_time
         t = int(steps_per_rollout * (eval_step + 1))
-        episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
+        episode_metrics, ep_completed = get_final_step_metrics(
+            learner_output.episode_metrics
+        )
         episode_metrics["steps_per_second"] = steps_per_rollout / elapsed_time
 
         # Separately log timesteps, actoring metrics and training metrics.
         logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
-        if ep_completed:  # only log episode metrics if an episode was completed in the rollout.
+        if (
+            ep_completed
+        ):  # only log episode metrics if an episode was completed in the rollout.
             logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
         train_metrics = learner_output.train_metrics
         # Calculate the number of optimiser steps per second. Since gradients are aggregated
@@ -568,14 +607,20 @@ def run_experiment(_config: DictConfig) -> float:
         episode_return = jnp.mean(evaluator_output.episode_metrics["episode_return"])
         episode_return = 0
 
-        steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
-        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
+        steps_per_eval = int(
+            jnp.sum(evaluator_output.episode_metrics["episode_length"])
+        )
+        evaluator_output.episode_metrics["steps_per_second"] = (
+            steps_per_eval / elapsed_time
+        )
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
 
         if save_checkpoint:
             checkpointer.save(
                 timestep=int(steps_per_rollout * (eval_step + 1)),
-                unreplicated_learner_state=unreplicate_n_dims(learner_output.learner_state),
+                unreplicated_learner_state=unreplicate_n_dims(
+                    learner_output.learner_state
+                ),
                 episode_return=episode_return,
             )
 

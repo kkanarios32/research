@@ -5,7 +5,7 @@ use_console: True # Whether to log to stdout.
 use_tb: False # Whether to use tensorboard logging.
 use_json: True # Whether to log marl-eval style to json files.
 use_neptune: False  # Whether to log to neptune.ai.
-use_wandb: True  # Whether to log to wandb.ai.
+use_wandb: False  # Whether to log to wandb.ai.
 
 # --- Other logger kwargs ---
 kwargs:

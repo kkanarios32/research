@@ -1,4 +1,5 @@
 import copy
+import functools
 import time
 from typing import Any, Callable, Dict, Tuple
 
@@ -17,7 +18,7 @@ from flax.core.frozen_dict import FrozenDict
 from jumanji.env import Environment
 from jumanji.types import TimeStep
 from jumanji.wrappers import AutoResetWrapper
-from navix import observations, rewards, terminations
+from navix import observations, rewards
 from navix.environments import DynamicObstacles
 from omegaconf import DictConfig, OmegaConf
 from rich.pretty import pprint
@@ -25,6 +26,7 @@ from rich.pretty import pprint
 from stoix.base_types import (
     ActorApply,
     AnakinExperimentOutput,
+    GoalActFn,
     LearnerFn,
     LogEnvState,
     OffPolicyLearnerState,
@@ -33,8 +35,11 @@ from stoix.base_types import (
 from stoix.networks.base import FeedForwardActor as Actor
 from stoix.networks.inputs import ObservationGoalInput
 from stoix.systems.gcrl.gcrl_types import QLearningTransition as Transition
-from stoix.systems.gcrl.search.evaluator import evaluator_setup
-from stoix.utils import make_env as environments
+from stoix.systems.gcrl.gcrl_types import SimState
+from stoix.systems.gcrl.search.evaluator import search_evaluator_setup
+from stoix.systems.gcrl.search.mcts.base import RecurrentFnOutput, RootFnOutput
+from stoix.systems.gcrl.search.mcts.mcts_policy import safe_policy
+from stoix.systems.search.search_types import EnvironmentStep, RootFnApply, SearchApply
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
@@ -46,21 +51,22 @@ from stoix.wrappers.navix import NavixGoalWrapper, NavixWrapper
 from stoix.wrappers.transforms import FlattenObservationWrapper
 
 
-def make_root_fn(actor_apply_fn: ActorApply, critic_apply_fn: CriticApply) -> RootFnApply:
+def make_root_fn(q_apply_fn: GoalActFn) -> RootFnApply:
     def root_fn(
-        params: ActorCriticParams,
-        observation: chex.ArrayTree,
-        state_embedding: chex.ArrayTree,
-        _: chex.PRNGKey,  # Unused key
+        params: FrozenDict,
+        state_embedding: SimState,
+        seed: chex.PRNGKey,
     ) -> mctx.RootFnOutput:
+        timestep = state_embedding.timestep
+        observation = timestep.observation
+        goal = timestep.extras["goal"]
+        values = q_apply_fn(params, observation, goal).preferences
+        value = jnp.max(values, axis=-1)
 
-        pi = actor_apply_fn(params.actor_params, observation)
-        value = critic_apply_fn(params.critic_params, observation)
-        logits = pi.logits
-
-        root_fn_output = mctx.RootFnOutput(
-            prior_logits=logits,
+        root_fn_output = RootFnOutput(
+            prior_logits=jnp.ones_like(values),
             value=value,
+            obstacle_value=jnp.zeros_like(value),
             embedding=state_embedding,
         )
 
@@ -74,24 +80,33 @@ def make_recurrent_fn(
     q_apply_fn: ActorApply,
     config: DictConfig,
 ) -> mctx.RecurrentFn:
+    vmap_obs_q = jax.vmap(q_apply_fn, in_axes=(None, None, 1))
+
     def recurrent_fn(
-        params: ActorCriticParams,
+        params: FrozenDict,
         _: chex.PRNGKey,  # Unused key
         action: chex.Array,
-        state_embedding: chex.ArrayTree,
-    ) -> Tuple[mctx.RecurrentFnOutput, chex.ArrayTree]:
+        state_embedding: SimState,
+    ) -> Tuple[RecurrentFnOutput, Any]:
+        timestep = state_embedding.timestep
+        goal = timestep.extras["goal"]
+        obstacles = timestep.extras["obstacles"]
+        obs = timestep.observation
 
-        next_state_embedding, next_timestep = environment_step(state_embedding, action)
+        values = q_apply_fn(params, obs, goal).preferences
+        value = values[..., action].squeeze(-1)
+        o_values = vmap_obs_q(params, obs, obstacles).preferences[action]
+        o_value = jnp.mean(jnp.max(o_values, axis=-1), axis=0)
 
-        logits = q_apply_fn(
-            params.actor_params, next_timestep.observation, next_timestep.extras["goal"]
-        ).preferences
+        next_state, next_timestep = environment_step(state_embedding.state, action)
+        next_state_embedding = SimState(next_state, next_timestep)
 
-        recurrent_fn_output = mctx.RecurrentFnOutput(
+        recurrent_fn_output = RecurrentFnOutput(
             reward=next_timestep.reward,
-            discount=next_timestep.discount * config.system.gamma,
-            prior_logits=logits,
-            value=next_timestep.discount * value,
+            discount=next_timestep.discount,
+            prior_logits=jnp.ones_like(values),
+            value=value,
+            obstacle_value=jnp.zeros_like(value),
         )
 
         return recurrent_fn_output, next_state_embedding
@@ -107,7 +122,10 @@ def get_warmup_fn(
     config: DictConfig,
 ) -> Callable:
     def warmup(
-        env_states: LogEnvState, timesteps: TimeStep, buffer_states: BufferState, keys: chex.PRNGKey
+        env_states: LogEnvState,
+        timesteps: TimeStep,
+        buffer_states: BufferState,
+        keys: chex.PRNGKey,
     ) -> Tuple[LogEnvState, TimeStep, BufferState, chex.PRNGKey]:
         def _env_step(
             carry: Tuple[LogEnvState, TimeStep, chex.PRNGKey], _: Any
@@ -118,7 +136,9 @@ def get_warmup_fn(
             # SELECT ACTION
             key, policy_key = jax.random.split(key)
             actor_policy = q_apply_fn(
-                q_params.online, last_timestep.observation, last_timestep.extras["goal"]
+                q_params.online,
+                last_timestep.observation,
+                last_timestep.extras["goal"],
             )
             action = actor_policy.sample(seed=policy_key)
 
@@ -132,7 +152,13 @@ def get_warmup_fn(
             goal = timestep.extras["goal"]
 
             transition = Transition(
-                done, action, timestep.reward, last_timestep.observation, next_obs, goal, info
+                done,
+                action,
+                timestep.reward,
+                last_timestep.observation,
+                next_obs,
+                goal,
+                info,
             )
 
             return (env_state, timestep, key), transition
@@ -172,7 +198,9 @@ def get_learner_fn(
             learner_state: OffPolicyLearnerState, _: Any
         ) -> Tuple[OffPolicyLearnerState, Transition]:
             """Step the environment."""
-            q_params, opt_states, buffer_state, key, env_state, last_timestep = learner_state
+            q_params, opt_states, buffer_state, key, env_state, last_timestep = (
+                learner_state
+            )
 
             # SELECT ACTION
             key, policy_key = jax.random.split(key)
@@ -191,7 +219,13 @@ def get_learner_fn(
             goal = timestep.extras["goal"]
 
             transition = Transition(
-                done, action, timestep.reward, last_timestep.observation, next_obs, goal, info
+                done,
+                action,
+                timestep.reward,
+                last_timestep.observation,
+                next_obs,
+                goal,
+                info,
             )
 
             learner_state = OffPolicyLearnerState(
@@ -217,8 +251,9 @@ def get_learner_fn(
                 target_q_params: FrozenDict,
                 transitions: Transition,
             ) -> jnp.ndarray:
-
-                q_tm1 = q_apply_fn(q_params, transitions.obs, transitions.goal).preferences
+                q_tm1 = q_apply_fn(
+                    q_params, transitions.obs, transitions.goal
+                ).preferences
                 q_t = q_apply_fn(
                     target_q_params, transitions.next_obs, transitions.goal
                 ).preferences
@@ -227,7 +262,9 @@ def get_learner_fn(
                 discount = 1.0 - transitions.done.astype(jnp.float32)
                 d_t = (discount * config.system.gamma).astype(jnp.float32)
                 r_t = jnp.clip(
-                    transitions.reward, -config.system.max_abs_reward, config.system.max_abs_reward
+                    transitions.reward,
+                    -config.system.max_abs_reward,
+                    config.system.max_abs_reward,
                 ).astype(jnp.float32)
                 a_tm1 = transitions.action
 
@@ -267,8 +304,12 @@ def get_learner_fn(
             # This calculation is inspired by the Anakin architecture demo notebook.
             # available at https://tinyurl.com/26tdzs5x
             # This pmean could be a regular mean as the batch axis is on the same device.
-            q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="batch")
-            q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="device")
+            q_grads, q_loss_info = jax.lax.pmean(
+                (q_grads, q_loss_info), axis_name="batch"
+            )
+            q_grads, q_loss_info = jax.lax.pmean(
+                (q_grads, q_loss_info), axis_name="device"
+            )
 
             # UPDATE Q PARAMS AND OPTIMISER STATE
             q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states)
@@ -314,7 +355,9 @@ def get_learner_fn(
 
         """
 
-        batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
+        batched_update_step = jax.vmap(
+            _update_step, in_axes=(0, None), axis_name="batch"
+        )
 
         learner_state, (episode_info, loss_info) = jax.lax.scan(
             batched_update_step, learner_state, None, config.arch.num_updates_per_eval
@@ -329,8 +372,8 @@ def get_learner_fn(
 
 
 def learner_setup(
-    env: Environment, keys: chex.Array, config: DictConfig
-) -> Tuple[LearnerFn[OffPolicyLearnerState], Actor, OffPolicyLearnerState]:
+    env: Environment, keys: chex.Array, config: DictConfig, model_env: Environment
+) -> Tuple[LearnerFn[Any], RootFnApply, SearchApply, Any]:
     """Initialise learner_fn, network, optimiser, environment and states."""
     # Get available TPU cores.
     n_devices = len(jax.devices())
@@ -351,7 +394,9 @@ def learner_setup(
     )
 
     q_network = Actor(
-        torso=q_network_torso, action_head=q_network_action_head, input_layer=ObservationGoalInput()
+        torso=q_network_torso,
+        action_head=q_network_action_head,
+        input_layer=ObservationGoalInput(),
     )
 
     eval_q_network_action_head = hydra.utils.instantiate(
@@ -387,6 +432,20 @@ def learner_setup(
     opt_states = q_opt_state
 
     q_network_apply_fn = q_network.apply
+
+    root_fn = make_root_fn(q_network_apply_fn)
+    environment_model_step = jax.vmap(model_env.step)
+    model_recurrent_fn = make_recurrent_fn(
+        environment_model_step, q_network_apply_fn, config
+    )
+    search_method = safe_policy
+    search_apply_fn = functools.partial(
+        search_method,
+        recurrent_fn=model_recurrent_fn,
+        num_simulations=config.system.num_simulations,
+        max_depth=config.system.max_depth,
+        **config.system.search_method_kwargs,
+    )
 
     # Pack apply and update functions.
     apply_fns = q_network_apply_fn
@@ -443,7 +502,8 @@ def learner_setup(
 
     def reshape_states(x: chex.Array) -> chex.Array:
         return x.reshape(
-            (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
+            (n_devices, config.arch.update_batch_size, config.arch.num_envs)
+            + x.shape[1:]
         )
 
     # (devices, update batch size, num_envs, ...)
@@ -464,7 +524,9 @@ def learner_setup(
     # Define params to be replicated across devices and batches.
     key, step_key, warmup_key = jax.random.split(key, num=3)
     step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
-    warmup_keys = jax.random.split(warmup_key, n_devices * config.arch.update_batch_size)
+    warmup_keys = jax.random.split(
+        warmup_key, n_devices * config.arch.update_batch_size
+    )
 
     def reshape_keys(x: chex.Array) -> chex.Array:
         return x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
@@ -481,7 +543,9 @@ def learner_setup(
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
-    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
+    replicate_learner = flax.jax_utils.replicate(
+        replicate_learner, devices=jax.devices()
+    )
 
     # Initialise learner state.
     params, opt_states, buffer_states = replicate_learner
@@ -493,7 +557,7 @@ def learner_setup(
         params, opt_states, buffer_states, step_keys, env_states, timesteps
     )
 
-    return learn, eval_q_network, init_learner_state
+    return learn, root_fn, search_apply_fn, init_learner_state
 
 
 def run_experiment(_config: DictConfig) -> float:
@@ -504,9 +568,9 @@ def run_experiment(_config: DictConfig) -> float:
     n_devices = len(jax.devices())
     config.num_devices = n_devices
     config = check_total_timesteps(config)
-    assert (
-        config.arch.num_updates >= config.arch.num_evaluation
-    ), "Number of updates per evaluation must be less than total number of updates."
+    assert config.arch.num_updates >= config.arch.num_evaluation, (
+        "Number of updates per evaluation must be less than total number of updates."
+    )
 
     # Create the environments for train and eval.
     def make_gcrl_env(name):
@@ -537,22 +601,31 @@ def run_experiment(_config: DictConfig) -> float:
     env, eval_env = make_gcrl_env("Navix-Empty-8x8-v0")
 
     # PRNG keys.
-    key, key_e, q_net_key = jax.random.split(jax.random.PRNGKey(config.arch.seed), num=3)
+    key, key_e, q_net_key = jax.random.split(
+        jax.random.PRNGKey(config.arch.seed), num=3
+    )
 
     # Setup learner.
-    learn, eval_q_network, learner_state = learner_setup(env, (key, q_net_key), config)
+    learn, root_fn, search_apply_fn, learner_state = learner_setup(
+        env, (key, q_net_key), config, eval_env
+    )
 
     # Setup evaluator.
-    evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = evaluator_setup(
-        eval_env=eval_env,
-        key_e=key_e,
-        eval_act_fn=obstacle_act_fn(config, eval_q_network.apply),
-        params=learner_state.params.online,
-        config=config,
+    evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = (
+        search_evaluator_setup(
+            eval_env=eval_env,
+            key_e=key_e,
+            search_apply_fn=search_apply_fn,
+            root_fn=root_fn,
+            params=learner_state.params,
+            config=config,
+        )
     )
 
     # Calculate number of updates per evaluation.
-    config.arch.num_updates_per_eval = config.arch.num_updates // config.arch.num_evaluation
+    config.arch.num_updates_per_eval = (
+        config.arch.num_updates // config.arch.num_evaluation
+    )
     steps_per_rollout = (
         n_devices
         * config.arch.num_updates_per_eval
@@ -589,12 +662,16 @@ def run_experiment(_config: DictConfig) -> float:
         # Log the results of the training.
         elapsed_time = time.time() - start_time
         t = int(steps_per_rollout * (eval_step + 1))
-        episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
+        episode_metrics, ep_completed = get_final_step_metrics(
+            learner_output.episode_metrics
+        )
         episode_metrics["steps_per_second"] = steps_per_rollout / elapsed_time
 
         # Separately log timesteps, actoring metrics and training metrics.
         logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
-        if ep_completed:  # only log episode metrics if an episode was completed in the rollout.
+        if (
+            ep_completed
+        ):  # only log episode metrics if an episode was completed in the rollout.
             logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
         train_metrics = learner_output.train_metrics
         # Calculate the number of optimiser steps per second. Since gradients are aggregated
@@ -622,14 +699,20 @@ def run_experiment(_config: DictConfig) -> float:
         episode_return = jnp.mean(evaluator_output.episode_metrics["episode_return"])
         episode_return = 0
 
-        steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
-        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
+        steps_per_eval = int(
+            jnp.sum(evaluator_output.episode_metrics["episode_length"])
+        )
+        evaluator_output.episode_metrics["steps_per_second"] = (
+            steps_per_eval / elapsed_time
+        )
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
 
         if save_checkpoint:
             checkpointer.save(
                 timestep=int(steps_per_rollout * (eval_step + 1)),
-                unreplicated_learner_state=unreplicate_n_dims(learner_output.learner_state),
+                unreplicated_learner_state=unreplicate_n_dims(
+                    learner_output.learner_state
+                ),
                 episode_return=episode_return,
             )
 
@@ -667,8 +750,8 @@ def run_experiment(_config: DictConfig) -> float:
 
 
 @hydra.main(
-    config_path="../../configs/default/anakin",
-    config_name="default_ff_dqn.yaml",
+    config_path="../../../configs/default/anakin/",
+    config_name="default_mcts_gcrl.yaml",
     version_base="1.2",
 )
 def hydra_entry_point(cfg: DictConfig) -> float:
@@ -677,7 +760,6 @@ def hydra_entry_point(cfg: DictConfig) -> float:
     OmegaConf.set_struct(cfg, False)
     OmegaConf.update(cfg, "arch.total_num_envs", 256)
     OmegaConf.update(cfg, "system.total_batch_size", 256)
-    print(cfg.arch.num_envs)
 
     # Run experiment.
     eval_performance = run_experiment(cfg)

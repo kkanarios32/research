@@ -52,14 +52,15 @@ from stoix.wrappers.episode_metrics import get_final_step_metrics
 tfd = tfp.distributions
 
 
-def make_root_fn(actor_apply_fn: ActorApply, critic_apply_fn: CriticApply) -> RootFnApply:
+def make_root_fn(
+    actor_apply_fn: ActorApply, critic_apply_fn: CriticApply
+) -> RootFnApply:
     def root_fn(
         params: ActorCriticParams,
         observation: chex.ArrayTree,
         state_embedding: chex.ArrayTree,
         _: chex.PRNGKey,  # Unused key
     ) -> mctx.RootFnOutput:
-
         pi = actor_apply_fn(params.actor_params, observation)
         value = critic_apply_fn(params.critic_params, observation)
         logits = pi.logits
@@ -87,7 +88,6 @@ def make_recurrent_fn(
         action: chex.Array,
         state_embedding: chex.ArrayTree,
     ) -> Tuple[mctx.RecurrentFnOutput, chex.ArrayTree]:
-
         next_state_embedding, next_timestep = environment_step(state_embedding, action)
 
         pi = actor_apply_fn(params.actor_params, next_timestep.observation)
@@ -113,11 +113,13 @@ def get_warmup_fn(
     buffer_add_fn: Callable,
     config: DictConfig,
 ) -> Callable:
-
     _, _, root_fn, search_apply_fn = apply_fns
 
     def warmup(
-        env_states: LogEnvState, timesteps: TimeStep, buffer_states: BufferState, keys: chex.PRNGKey
+        env_states: LogEnvState,
+        timesteps: TimeStep,
+        buffer_states: BufferState,
+        keys: chex.PRNGKey,
     ) -> Tuple[LogEnvState, TimeStep, BufferState, chex.PRNGKey]:
         def _env_step(
             carry: Tuple[LogEnvState, TimeStep, chex.PRNGKey], _: Any
@@ -127,11 +129,15 @@ def get_warmup_fn(
             env_state, last_timestep, key = carry
             # SELECT ACTION
             key, root_key, policy_key = jax.random.split(key, num=3)
-            root = root_fn(params, last_timestep.observation, env_state.env_state, root_key)
+            root = root_fn(
+                params, last_timestep.observation, env_state.env_state, root_key
+            )
             search_output = search_apply_fn(params, policy_key, root)
             action = search_output.action
             search_policy = search_output.action_weights
-            search_value = search_output.search_tree.node_values[:, mctx.Tree.ROOT_INDEX]
+            search_value = search_output.search_tree.node_values[
+                :, mctx.Tree.ROOT_INDEX
+            ]
 
             # STEP ENVIRONMENT
             env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
@@ -185,20 +191,30 @@ def get_learner_fn(
     actor_update_fn, critic_update_fn = update_fns
     buffer_add_fn, buffer_sample_fn = buffer_fns
 
-    def _update_step(learner_state: ZLearnerState, _: Any) -> Tuple[ZLearnerState, Tuple]:
+    def _update_step(
+        learner_state: ZLearnerState, _: Any
+    ) -> Tuple[ZLearnerState, Tuple]:
         """A single update of the network."""
 
-        def _env_step(learner_state: ZLearnerState, _: Any) -> Tuple[ZLearnerState, ExItTransition]:
+        def _env_step(
+            learner_state: ZLearnerState, _: Any
+        ) -> Tuple[ZLearnerState, ExItTransition]:
             """Step the environment."""
-            params, opt_states, buffer_state, key, env_state, last_timestep = learner_state
+            params, opt_states, buffer_state, key, env_state, last_timestep = (
+                learner_state
+            )
 
             # SELECT ACTION
             key, root_key, policy_key = jax.random.split(key, num=3)
-            root = root_fn(params, last_timestep.observation, env_state.env_state, root_key)
+            root = root_fn(
+                params, last_timestep.observation, env_state.env_state, root_key
+            )
             search_output = search_apply_fn(params, policy_key, root)
             action = search_output.action
             search_policy = search_output.action_weights
-            search_value = search_output.search_tree.node_values[:, mctx.Tree.ROOT_INDEX]
+            search_value = search_output.search_tree.node_values[
+                :, mctx.Tree.ROOT_INDEX
+            ]
 
             # STEP ENVIRONMENT
             env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
@@ -245,7 +261,9 @@ def get_learner_fn(
 
                 # CALCULATE LOSS
                 actor_loss = (
-                    tfd.Categorical(probs=sequence.search_policy).kl_divergence(actor_policy).mean()
+                    tfd.Categorical(probs=sequence.search_policy)
+                    .kl_divergence(actor_policy)
+                    .mean()
                 )
                 entropy = actor_policy.entropy().mean()
 
@@ -295,7 +313,9 @@ def get_learner_fn(
 
             # CALCULATE CRITIC LOSS
             critic_grad_fn = jax.grad(_critic_loss_fn, has_aux=True)
-            critic_grads, critic_loss_info = critic_grad_fn(params.critic_params, sequence)
+            critic_grads, critic_loss_info = critic_grad_fn(
+                params.critic_params, sequence
+            )
 
             # Compute the parallel mean (pmean) over the batch.
             # This calculation is inspired by the Anakin architecture demo notebook.
@@ -327,11 +347,15 @@ def get_learner_fn(
             critic_updates, critic_new_opt_state = critic_update_fn(
                 critic_grads, opt_states.critic_opt_state
             )
-            critic_new_params = optax.apply_updates(params.critic_params, critic_updates)
+            critic_new_params = optax.apply_updates(
+                params.critic_params, critic_updates
+            )
 
             # PACK NEW PARAMS AND OPTIMISER STATE
             new_params = ActorCriticParams(actor_new_params, critic_new_params)
-            new_opt_state = ActorCriticOptStates(actor_new_opt_state, critic_new_opt_state)
+            new_opt_state = ActorCriticOptStates(
+                actor_new_opt_state, critic_new_opt_state
+            )
 
             # PACK LOSS INFO
             loss_info = {
@@ -354,10 +378,14 @@ def get_learner_fn(
         metric = traj_batch.info
         return learner_state, (metric, loss_info)
 
-    def learner_fn(learner_state: ZLearnerState) -> AnakinExperimentOutput[ZLearnerState]:
+    def learner_fn(
+        learner_state: ZLearnerState,
+    ) -> AnakinExperimentOutput[ZLearnerState]:
         """Learner function."""
 
-        batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
+        batched_update_step = jax.vmap(
+            _update_step, in_axes=(0, None), axis_name="batch"
+        )
 
         learner_state, (episode_info, loss_info) = jax.lax.scan(
             batched_update_step, learner_state, None, config.arch.num_updates_per_eval
@@ -540,19 +568,27 @@ def learner_setup(
     # Define params to be replicated across devices and batches.
     key, step_key, warmup_key = jax.random.split(key, num=3)
     step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
-    warmup_keys = jax.random.split(warmup_key, n_devices * config.arch.update_batch_size)
-    reshape_keys = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
+    warmup_keys = jax.random.split(
+        warmup_key, n_devices * config.arch.update_batch_size
+    )
+    reshape_keys = lambda x: x.reshape(
+        (n_devices, config.arch.update_batch_size) + x.shape[1:]
+    )
     step_keys = reshape_keys(jnp.stack(step_keys))
     warmup_keys = reshape_keys(jnp.stack(warmup_keys))
     opt_states = ActorCriticOptStates(actor_opt_state, critic_opt_state)
     replicate_learner = (params, opt_states, buffer_states)
 
     # Duplicate learner for update_batch_size.
-    broadcast = lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
+    broadcast = lambda x: jnp.broadcast_to(
+        x, (config.arch.update_batch_size,) + x.shape
+    )
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
-    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
+    replicate_learner = flax.jax_utils.replicate(
+        replicate_learner, devices=jax.devices()
+    )
 
     # Initialise learner state.
     params, opt_states, buffer_states = replicate_learner
@@ -575,9 +611,9 @@ def run_experiment(_config: DictConfig) -> float:
     n_devices = len(jax.devices())
     config.num_devices = n_devices
     config = check_total_timesteps(config)
-    assert (
-        config.arch.num_updates >= config.arch.num_evaluation
-    ), "Number of updates per evaluation must be less than total number of updates."
+    assert config.arch.num_updates >= config.arch.num_evaluation, (
+        "Number of updates per evaluation must be less than total number of updates."
+    )
 
     # Create the environments for train and eval.
     env, eval_env = environments.make(config=config)
@@ -593,17 +629,21 @@ def run_experiment(_config: DictConfig) -> float:
     )
 
     # Setup evaluator.
-    evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = search_evaluator_setup(
-        eval_env=eval_env,
-        key_e=key_e,
-        search_apply_fn=search_apply_fn,
-        root_fn=root_fn,
-        params=learner_state.params,
-        config=config,
+    evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = (
+        search_evaluator_setup(
+            eval_env=eval_env,
+            key_e=key_e,
+            search_apply_fn=search_apply_fn,
+            root_fn=root_fn,
+            params=learner_state.params,
+            config=config,
+        )
     )
 
     # Calculate number of updates per evaluation.
-    config.arch.num_updates_per_eval = config.arch.num_updates // config.arch.num_evaluation
+    config.arch.num_updates_per_eval = (
+        config.arch.num_updates // config.arch.num_evaluation
+    )
     steps_per_rollout = (
         n_devices
         * config.arch.num_updates_per_eval
@@ -640,12 +680,16 @@ def run_experiment(_config: DictConfig) -> float:
         # Log the results of the training.
         elapsed_time = time.time() - start_time
         t = int(steps_per_rollout * (eval_step + 1))
-        episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
+        episode_metrics, ep_completed = get_final_step_metrics(
+            learner_output.episode_metrics
+        )
         episode_metrics["steps_per_second"] = steps_per_rollout / elapsed_time
 
         # Separately log timesteps, actoring metrics and training metrics.
         logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
-        if ep_completed:  # only log episode metrics if an episode was completed in the rollout.
+        if (
+            ep_completed
+        ):  # only log episode metrics if an episode was completed in the rollout.
             logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
         train_metrics = learner_output.train_metrics
         # Calculate the number of optimiser steps per second. Since gradients are aggregated
@@ -672,15 +716,21 @@ def run_experiment(_config: DictConfig) -> float:
         elapsed_time = time.time() - start_time
         episode_return = jnp.mean(evaluator_output.episode_metrics["episode_return"])
 
-        steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
-        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
+        steps_per_eval = int(
+            jnp.sum(evaluator_output.episode_metrics["episode_length"])
+        )
+        evaluator_output.episode_metrics["steps_per_second"] = (
+            steps_per_eval / elapsed_time
+        )
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
 
         if save_checkpoint:
             # Save checkpoint of learner state
             checkpointer.save(
                 timestep=int(steps_per_rollout * (eval_step + 1)),
-                unreplicated_learner_state=unreplicate_n_dims(learner_output.learner_state),
+                unreplicated_learner_state=unreplicate_n_dims(
+                    learner_output.learner_state
+                ),
                 episode_return=episode_return,
             )
 
@@ -704,20 +754,28 @@ def run_experiment(_config: DictConfig) -> float:
 
         elapsed_time = time.time() - start_time
         t = int(steps_per_rollout * (eval_step + 1))
-        steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
-        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
+        steps_per_eval = int(
+            jnp.sum(evaluator_output.episode_metrics["episode_length"])
+        )
+        evaluator_output.episode_metrics["steps_per_second"] = (
+            steps_per_eval / elapsed_time
+        )
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.ABSOLUTE)
 
     # Stop the logger.
     logger.stop()
     # Record the performance for the final evaluation run. If the absolute metric is not
     # calculated, this will be the final evaluation run.
-    eval_performance = float(jnp.mean(evaluator_output.episode_metrics[config.env.eval_metric]))
+    eval_performance = float(
+        jnp.mean(evaluator_output.episode_metrics[config.env.eval_metric])
+    )
     return eval_performance
 
 
 @hydra.main(
-    config_path="../../configs/default/anakin", config_name="default_ff_az.yaml", version_base="1.2"
+    config_path="../../configs/default/anakin",
+    config_name="default_ff_az.yaml",
+    version_base="1.2",
 )
 def hydra_entry_point(cfg: DictConfig) -> float:
     """Experiment entry point."""

@@ -9,13 +9,19 @@ from optax import OptState
 from typing_extensions import NamedTuple
 
 from stoix.base_types import Action, ActorCriticParams, Done, Observation, Value
+from stoix.systems.gcrl.gcrl_types import SimState
 
 SearchApply = Callable[[FrozenDict, chex.PRNGKey, mctx.RootFnOutput], mctx.PolicyOutput]
-RootFnApply = Callable[[FrozenDict, Observation, chex.ArrayTree, chex.PRNGKey], mctx.RootFnOutput]
+RootFnApply = Callable[
+    [FrozenDict, Observation, chex.ArrayTree, chex.PRNGKey], mctx.RootFnOutput
+]
+GoalRootFnApply = Callable[[FrozenDict, SimState, chex.PRNGKey], mctx.RootFnOutput]
 EnvironmentStep = Callable[[chex.ArrayTree, Action], Tuple[chex.ArrayTree, TimeStep]]
 
 RepresentationApply = Callable[[FrozenDict, Observation], chex.Array]
-DynamicsApply = Callable[[FrozenDict, chex.Array, chex.Array], Tuple[chex.Array, DistributionLike]]
+DynamicsApply = Callable[
+    [FrozenDict, chex.Array, chex.Array], Tuple[chex.Array, DistributionLike]
+]
 
 
 class ExItTransition(NamedTuple):

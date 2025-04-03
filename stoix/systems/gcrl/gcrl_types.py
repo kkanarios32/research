@@ -2,6 +2,7 @@ from typing import Dict
 
 import chex
 from flax.core.frozen_dict import FrozenDict
+from jumanji.types import TimeStep
 from optax import OptState
 from typing_extensions import NamedTuple
 
@@ -41,3 +42,8 @@ class ContrastiveOptState(NamedTuple):
 
     sa_opt_state: OptState
     g_opt_state: OptState
+
+
+class SimState(NamedTuple):
+    state: chex.ArrayTree
+    timestep: TimeStep

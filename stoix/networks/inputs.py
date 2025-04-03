@@ -44,21 +44,23 @@ class CNNObservationActionInput(nn.Module):
 
 
 class EmbeddingActionInput(nn.Module):
-
     action_dim: int
 
     @nn.compact
-    def __call__(self, observation_embedding: chex.Array, action: chex.Array) -> chex.Array:
+    def __call__(
+        self, observation_embedding: chex.Array, action: chex.Array
+    ) -> chex.Array:
         x = jnp.concatenate([observation_embedding, action], axis=-1)
         return x
 
 
 class EmbeddingActionOnehotInput(nn.Module):
-
     action_dim: int
 
     @nn.compact
-    def __call__(self, observation_embedding: chex.Array, action: chex.Array) -> chex.Array:
+    def __call__(
+        self, observation_embedding: chex.Array, action: chex.Array
+    ) -> chex.Array:
         action_one_hot = jax.nn.one_hot(action, self.action_dim)
         x = jnp.concatenate([observation_embedding, action_one_hot], axis=-1)
         return x
@@ -69,6 +71,7 @@ class ObservationGoalInput(nn.Module):
 
     @nn.compact
     def __call__(self, observation: Observation, goal: chex.Array) -> chex.Array:
-        observation = observation.agent_view
+        if hasattr(observation, "agent_view"):
+            observation = observation.agent_view
         x = jnp.concatenate([observation, goal], axis=-1)
         return x

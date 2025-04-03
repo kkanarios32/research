@@ -68,7 +68,9 @@ def get_search_evaluator_fn(
 
         return eval_metrics
 
-    def evaluator_fn(trained_params: FrozenDict, key: chex.PRNGKey) -> EvaluationOutput[EvalState]:
+    def evaluator_fn(
+        trained_params: FrozenDict, key: chex.PRNGKey
+    ) -> EvaluationOutput[EvalState]:
         """Evaluator function."""
 
         # Initialise environment states and timesteps.
@@ -125,7 +127,9 @@ def search_evaluator_setup(
         log_solve_rate = False
 
     eval_apply_fn = search_apply_fn
-    evaluator = get_search_evaluator_fn(eval_env, eval_apply_fn, root_fn, config, log_solve_rate)
+    evaluator = get_search_evaluator_fn(
+        eval_env, eval_apply_fn, root_fn, config, log_solve_rate
+    )
     absolute_metric_evaluator = get_search_evaluator_fn(
         eval_env,
         eval_apply_fn,
