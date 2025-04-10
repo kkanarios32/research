@@ -39,8 +39,8 @@ class RecurrentFnOutput:
     reward: chex.Array
     discount: chex.Array
     prior_logits: chex.Array
+    obstacle_logits: chex.Array
     value: chex.Array
-    obstacle_value: chex.Array
 
 
 Action = chex.Array
@@ -61,8 +61,8 @@ class RootFnOutput:
     """
 
     prior_logits: chex.Array
+    obstacle_logits: chex.Array
     value: chex.Array
-    obstacle_value: chex.Array
     embedding: RecurrentState
 
 

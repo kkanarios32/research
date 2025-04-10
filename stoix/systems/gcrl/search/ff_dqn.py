@@ -54,19 +54,18 @@ from stoix.wrappers.transforms import FlattenObservationWrapper
 def make_root_fn(q_apply_fn: GoalActFn) -> RootFnApply:
     def root_fn(
         params: FrozenDict,
+        observation: chex.ArrayTree,
+        goal: chex.ArrayTree,
         state_embedding: SimState,
         seed: chex.PRNGKey,
     ) -> mctx.RootFnOutput:
-        timestep = state_embedding.timestep
-        observation = timestep.observation
-        goal = timestep.extras["goal"]
         values = q_apply_fn(params, observation, goal).preferences
         value = jnp.max(values, axis=-1)
 
         root_fn_output = RootFnOutput(
-            prior_logits=jnp.ones_like(values),
+            prior_logits=values,
+            obstacle_logits=jnp.zeros_like(values),
             value=value,
-            obstacle_value=jnp.zeros_like(value),
             embedding=state_embedding,
         )
 
@@ -88,25 +87,22 @@ def make_recurrent_fn(
         action: chex.Array,
         state_embedding: SimState,
     ) -> Tuple[RecurrentFnOutput, Any]:
-        timestep = state_embedding.timestep
-        goal = timestep.extras["goal"]
-        obstacles = timestep.extras["obstacles"]
-        obs = timestep.observation
+        next_state_embedding, next_timestep = environment_step(state_embedding, action)
+        goal = next_timestep.extras["goal"]
+        obstacles = next_timestep.extras["obstacles"]
+        obs = next_timestep.observation
 
-        values = q_apply_fn(params, obs, goal).preferences
-        value = values[..., action].squeeze(-1)
+        values = q_apply_fn(params, next_timestep.observation, goal).preferences
+        value = jnp.max(values, axis=-1)
         o_values = vmap_obs_q(params, obs, obstacles).preferences[action]
-        o_value = jnp.mean(jnp.max(o_values, axis=-1), axis=0)
-
-        next_state, next_timestep = environment_step(state_embedding.state, action)
-        next_state_embedding = SimState(next_state, next_timestep)
+        o_values = jnp.max(o_values, axis=0)
 
         recurrent_fn_output = RecurrentFnOutput(
             reward=next_timestep.reward,
-            discount=next_timestep.discount,
-            prior_logits=jnp.ones_like(values),
-            value=value,
-            obstacle_value=jnp.zeros_like(value),
+            discount=next_timestep.discount * config.system.gamma,
+            prior_logits=values,
+            obstacle_logits=o_values,
+            value=next_timestep.discount * value,
         )
 
         return recurrent_fn_output, next_state_embedding
@@ -578,7 +574,7 @@ def run_experiment(_config: DictConfig) -> float:
         eval_env = DynamicObstacles.create(
             height=8,
             width=8,
-            n_obstacles=2,
+            n_obstacles=8,
             random_start=False,
             observation_fn=observations.symbolic,
             reward_fn=rewards.on_goal_reached,

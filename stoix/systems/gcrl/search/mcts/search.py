@@ -252,8 +252,8 @@ def expand(
         tree,
         next_node_index,
         step.prior_logits,
+        step.obstacle_logits,
         step.value,
-        step.obstacle_value,
         embedding,
     )
 
@@ -336,8 +336,8 @@ def update_tree_node(
     tree: Tree[T],
     node_index: chex.Array,
     prior_logits: chex.Array,
+    obstacle_logits: chex.Array,
     value: chex.Array,
-    obstacle_value: chex.Array,
     embedding: chex.Array,
 ) -> Tree[T]:
     """Updates the tree at node index.
@@ -363,9 +363,11 @@ def update_tree_node(
         children_prior_logits=batch_update(
             tree.children_prior_logits, prior_logits, node_index
         ),
+        children_obstacle_logits=batch_update(
+            tree.children_obstacle_logits, obstacle_logits, node_index
+        ),
         raw_values=batch_update(tree.raw_values, value, node_index),
         node_values=batch_update(tree.node_values, value, node_index),
-        obstacle_values=batch_update(tree.obstacle_values, obstacle_value, node_index),
         node_visits=batch_update(tree.node_visits, new_visit, node_index),
         embeddings=jax.tree_util.tree_map(
             lambda t, s: batch_update(t, s, node_index), tree.embeddings, embedding
@@ -398,7 +400,9 @@ def instantiate_tree_from_root(
         node_visits=jnp.zeros(batch_node, dtype=jnp.int32),
         raw_values=jnp.zeros(batch_node, dtype=data_dtype),
         node_values=jnp.zeros(batch_node, dtype=data_dtype),
-        obstacle_values=jnp.zeros(batch_node, dtype=data_dtype),
+        children_obstacle_logits=jnp.zeros(
+            batch_node_action, dtype=root.obstacle_logits.dtype
+        ),
         parents=jnp.full(batch_node, Tree.NO_PARENT, dtype=jnp.int32),
         action_from_parent=jnp.full(batch_node, Tree.NO_PARENT, dtype=jnp.int32),
         children_index=jnp.full(batch_node_action, Tree.UNVISITED, dtype=jnp.int32),
@@ -419,8 +423,8 @@ def instantiate_tree_from_root(
         tree,
         root_index,
         root.prior_logits,
+        root.obstacle_logits,
         root.value,
-        root.obstacle_value,
         root.embedding,
     )
     return tree

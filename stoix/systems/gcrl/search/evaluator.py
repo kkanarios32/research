@@ -8,7 +8,6 @@ from jumanji.env import Environment
 from omegaconf import DictConfig
 
 from stoix.base_types import EvalFn, EvalState, EvaluationOutput
-from stoix.systems.gcrl.gcrl_types import SimState
 from stoix.systems.search.search_types import GoalRootFnApply, SearchApply
 from stoix.utils.jax_utils import unreplicate_batch_dim
 
@@ -30,15 +29,15 @@ def get_search_evaluator_fn(
             """Step the environment."""
             # PRNG keys.
             key, env_state, last_timestep, step_count, episode_return = eval_state
+            goal = last_timestep.extras["goal"]
 
             # Select action.
             key, root_key, policy_key = jax.random.split(key, num=3)
-            timestep, model_env_state = jax.tree_util.tree_map(
+            obs, goal, model_env_state = jax.tree_util.tree_map(
                 lambda x: x[jnp.newaxis, ...],
-                (last_timestep, env_state),
+                (last_timestep.observation, goal, env_state),
             )
-            sim_state = SimState(model_env_state, timestep)
-            root = root_fn(params, sim_state, root_key)
+            root = root_fn(params, obs, goal, model_env_state, root_key)
             search_output = search_apply_fn(params, policy_key, root)
             action = search_output.action
 
