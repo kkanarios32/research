@@ -17,6 +17,6 @@ training_epsilon: 0.1  # epsilon for the epsilon-greedy policy during training
 evaluation_epsilon: 0.00  # epsilon for the epsilon-greedy policy during evaluation
 max_abs_reward : 1000.0  # maximum absolute reward value
 huber_loss_parameter: 0.0  # parameter for the huber loss. If 0, it uses MSE loss.
-num_simulations: 25 # Number of simulations to run.
+num_simulations: 200 # Number of simulations to run.
 max_depth: 10 # Maximum depth of the search tree.
 search_method_kwargs: {} # Additional kwargs for the search method.

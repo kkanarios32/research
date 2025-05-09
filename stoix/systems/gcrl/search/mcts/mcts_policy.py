@@ -34,7 +34,6 @@ def action_selection(
     depth: chex.Numeric,
     pb_c_init: float = 1.25,
     pb_c_base: float = 19652.0,
-    pb_o: float = 500.0,
     *,
     qtransform: QTransform = qtransforms.qtransform_by_parent_and_siblings,
 ) -> chex.Array:
@@ -42,14 +41,14 @@ def action_selection(
     node_visit = tree.node_visits[node_index]
     pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.0) / pb_c_base)
     prior_logits = tree.children_prior_logits[node_index]
-    prior_probs = jax.nn.softmax(prior_logits)
+    obstacle_logits = tree.children_obstacle_logits[node_index]
+    prior_probs = jax.nn.softmax(prior_logits / obstacle_logits)
     policy_score = jnp.sqrt(node_visit) * pb_c * prior_probs / (visit_counts + 1)
     chex.assert_shape([node_index, node_visit], ())
     chex.assert_equal_shape([prior_probs, visit_counts, policy_score])
     value_score = qtransform(tree, node_index)
-    obstacle_logits = tree.children_obstacle_logits[node_index]
-    normalized_obstacles = jax.nn.softmax(obstacle_logits)
-    obstacle_penalty = jnp.sqrt(node_visit) * normalized_obstacles / (visit_counts + 1)
+    obstacle_probs = jax.nn.softmax(obstacle_logits)
+    obstacle_penalty = normalized_obstacles * (1 - jnp.exp(visit_counts**2 / 1000))
 
     # Add tiny bit of randomness for tie break
     node_noise_score = 1e-7 * jax.random.uniform(rng_key, (tree.num_actions,))
